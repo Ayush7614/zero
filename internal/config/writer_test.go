@@ -718,6 +718,23 @@ func TestSetThemePreservesUnknownTopLevelFields(t *testing.T) {
 	}
 }
 
+// setNotify replaces the stored notify block with value through UpdateNotify
+// and returns the re-read config, so the tests below can assert on a
+// FileConfig-shaped result. Every product surface uses UpdateNotify's merge
+// form directly; this replace form exists only for these tests.
+func setNotify(path string, value NotifyConfig) (FileConfig, error) {
+	next, err := UpdateNotify(path, func(NotifyConfig) NotifyConfig { return value })
+	if err != nil {
+		return FileConfig{}, err
+	}
+	cfg, err := loadConfigFile(path)
+	if err != nil {
+		return FileConfig{}, err
+	}
+	cfg.Notify = next
+	return cfg, nil
+}
+
 func TestSetNotifyPersistsValidValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "zero.json")
 	writeConfigFixture(t, path, FileConfig{
@@ -727,9 +744,9 @@ func TestSetNotifyPersistsValidValues(t *testing.T) {
 		},
 	}, 0o600)
 
-	cfg, err := SetNotify(path, NotifyConfig{Mode: "  both  ", FocusMode: "  unfocused  "})
+	cfg, err := setNotify(path, NotifyConfig{Mode: "  both  ", FocusMode: "  unfocused  "})
 	if err != nil {
-		t.Fatalf("SetNotify() error = %v", err)
+		t.Fatalf("setNotify() error = %v", err)
 	}
 	if cfg.Notify.Mode != "both" || cfg.Notify.FocusMode != "unfocused" {
 		t.Fatalf("Notify = %+v, want mode=both focusMode=unfocused (trimmed)", cfg.Notify)
@@ -739,14 +756,14 @@ func TestSetNotifyPersistsValidValues(t *testing.T) {
 		t.Fatalf("persisted Notify = %+v, want mode=both focusMode=unfocused", persisted.Notify)
 	}
 	if persisted.ActiveProvider != "openai" || len(persisted.Providers) != 1 {
-		t.Fatalf("provider config was not preserved by SetNotify: %#v", persisted)
+		t.Fatalf("provider config was not preserved by setNotify: %#v", persisted)
 	}
 }
 
 func TestSetNotifyRejectsInvalidMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "zero.json")
 	writeConfigFixture(t, path, FileConfig{ActiveProvider: "openai"}, 0o600)
-	if _, err := SetNotify(path, NotifyConfig{Mode: "loud", FocusMode: "unfocused"}); err == nil {
+	if _, err := setNotify(path, NotifyConfig{Mode: "loud", FocusMode: "unfocused"}); err == nil {
 		t.Fatal("expected error for invalid notify.mode")
 	}
 }
@@ -754,25 +771,25 @@ func TestSetNotifyRejectsInvalidMode(t *testing.T) {
 func TestSetNotifyRejectsInvalidFocusMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "zero.json")
 	writeConfigFixture(t, path, FileConfig{ActiveProvider: "openai"}, 0o600)
-	if _, err := SetNotify(path, NotifyConfig{Mode: "off", FocusMode: "sideways"}); err == nil {
+	if _, err := setNotify(path, NotifyConfig{Mode: "off", FocusMode: "sideways"}); err == nil {
 		t.Fatal("expected error for invalid notify.focusMode")
 	}
 }
 
 func TestSetNotifyRejectsEmptyConfigPath(t *testing.T) {
-	if _, err := SetNotify("", NotifyConfig{Mode: "off"}); err == nil {
+	if _, err := setNotify("", NotifyConfig{Mode: "off"}); err == nil {
 		t.Fatal("expected error for empty config path")
 	}
 }
 
 func TestSetNotifyBlankValuesPreservedAsDefaults(t *testing.T) {
 	// An empty mode/focusMode stored on disk is a valid "use the built-in
-	// defaults" signal — SetNotify must not reject blanks, and they must round
+	// defaults" signal — setNotify must not reject blanks, and they must round
 	// trip unchanged.
 	path := filepath.Join(t.TempDir(), "zero.json")
 	writeConfigFixture(t, path, FileConfig{ActiveProvider: "openai"}, 0o600)
-	if _, err := SetNotify(path, NotifyConfig{}); err != nil {
-		t.Fatalf("SetNotify({}) should accept blank values, got error: %v", err)
+	if _, err := setNotify(path, NotifyConfig{}); err != nil {
+		t.Fatalf("setNotify({}) should accept blank values, got error: %v", err)
 	}
 	persisted := readConfigFixture(t, path)
 	if persisted.Notify.Mode != "" || persisted.Notify.FocusMode != "" {
@@ -784,7 +801,7 @@ func TestSetNotifyBlankValuesPreservedAsDefaults(t *testing.T) {
 // values whose EXPLICIT presence matters. The typed serializer's omitempty
 // cannot round-trip tools.deferThreshold: 0 (explicit "never defer" vs unset
 // "use default 3") or an MCP server's disabled: false (explicitly enabled), so
-// SetNotify/UpdateNotify edit only the notify member's bytes instead. The
+// UpdateNotify edits only the notify member's bytes instead. The
 // assertions run against the RAW file, because reading through FileConfig
 // would hide exactly the presence loss being tested.
 func TestSetNotifyPreservesExplicitUnrelatedValues(t *testing.T) {
@@ -807,8 +824,8 @@ func TestSetNotifyPreservesExplicitUnrelatedValues(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if _, err := SetNotify(path, NotifyConfig{Mode: "off", FocusMode: "always"}); err != nil {
-				t.Fatalf("SetNotify: %v", err)
+			if _, err := setNotify(path, NotifyConfig{Mode: "off", FocusMode: "always"}); err != nil {
+				t.Fatalf("setNotify: %v", err)
 			}
 
 			raw, err := os.ReadFile(path)
@@ -851,8 +868,8 @@ func TestSetNotifyResetRemovesEveryDuplicateNotifyMember(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := SetNotify(path, NotifyConfig{}); err != nil {
-		t.Fatalf("SetNotify({}) reset: %v", err)
+	if _, err := setNotify(path, NotifyConfig{}); err != nil {
+		t.Fatalf("setNotify({}) reset: %v", err)
 	}
 
 	raw, err := os.ReadFile(path)
@@ -876,8 +893,8 @@ func TestSetNotifyResetRemovesEveryDuplicateNotifyMember(t *testing.T) {
 	if err := os.WriteFile(path, []byte(duplicated), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SetNotify(path, NotifyConfig{Mode: "off", FocusMode: "always"}); err != nil {
-		t.Fatalf("SetNotify replace: %v", err)
+	if _, err := setNotify(path, NotifyConfig{Mode: "off", FocusMode: "always"}); err != nil {
+		t.Fatalf("setNotify replace: %v", err)
 	}
 	raw, err = os.ReadFile(path)
 	if err != nil {
@@ -1684,7 +1701,7 @@ func TestUpdateNotifyRacesExistingConfigMutatorWithoutLoss(t *testing.T) {
 // fields of duplicate JSON members into one struct, so a full replacement that
 // omits a field could inherit it from an earlier duplicate —
 // {"notify":{"mode":"off"},"notify":{"focusMode":"focused"}} +
-// SetNotify({FocusMode:"always"}) must yield blank/always, not off/always.
+// setNotify({FocusMode:"always"}) must yield blank/always, not off/always.
 // The editor removes every duplicate and inserts the replacement fresh.
 func TestSetNotifyReplacementInheritsNoFieldFromEarlierDuplicate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "zero.json")
@@ -1693,8 +1710,8 @@ func TestSetNotifyReplacementInheritsNoFieldFromEarlierDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := SetNotify(path, NotifyConfig{FocusMode: "always"}); err != nil {
-		t.Fatalf("SetNotify: %v", err)
+	if _, err := setNotify(path, NotifyConfig{FocusMode: "always"}); err != nil {
+		t.Fatalf("setNotify: %v", err)
 	}
 	stored, err := UserNotify(path)
 	if err != nil {
@@ -1727,8 +1744,8 @@ func TestSetNotifySingleMemberReplacedInPlace(t *testing.T) {
 	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SetNotify(path, NotifyConfig{Mode: "off", FocusMode: "always"}); err != nil {
-		t.Fatalf("SetNotify: %v", err)
+	if _, err := setNotify(path, NotifyConfig{Mode: "off", FocusMode: "always"}); err != nil {
+		t.Fatalf("setNotify: %v", err)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
