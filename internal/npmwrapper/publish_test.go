@@ -23,6 +23,10 @@ import (
 // FAKE_NPM_CLOBBER_LATEST=1 makes every publish take `latest`, the failure the
 // script must stop on. FAKE_NPM_VERSION_LOOKUP_ERRORS=<n> fails the first n
 // version lookups with a network error instead of answering them.
+// FAKE_NPM_APPLY_AFTER=<n> applies each publish only after n further lookups,
+// the way npm accepts an upload and shows the version minutes later; until
+// then the version and its dist-tag are invisible. When a wrapper is published,
+// the aliased versions not yet visible are recorded in missingAtWrapperPublish.
 const fakeNpm = `#!/usr/bin/env node
 const fs = require('fs');
 const stateFile = process.env.FAKE_NPM_STATE;
@@ -31,7 +35,17 @@ const args = process.argv.slice(2);
 fs.appendFileSync(stateFile + '.log', JSON.stringify({ args, cwd: process.cwd() }) + '\n');
 const save = () => fs.writeFileSync(stateFile, JSON.stringify(state));
 const notFound = (detail) => { process.stderr.write('npm error code E404\nnpm error 404 ' + detail + '\n'); process.exit(1); };
+state.pending = state.pending || [];
+const apply = (publish) => {
+  state.versions.push(publish.version);
+  state.distTags[publish.tag] = publish.version;
+  if (process.env.FAKE_NPM_CLOBBER_LATEST === '1') state.distTags.latest = publish.version;
+};
 if (args[0] === 'view') {
+  for (const publish of state.pending) publish.wait -= 1;
+  state.pending.filter((publish) => publish.wait <= 0).forEach(apply);
+  state.pending = state.pending.filter((publish) => publish.wait > 0);
+  save();
   const [spec, field] = args.slice(1);
   const at = spec.lastIndexOf('@');
   const name = at > 0 ? spec.slice(0, at) : spec;
@@ -62,14 +76,19 @@ if (args[0] === 'publish') {
     process.stderr.write('fake npm: refusing to publish ' + pkg.name + '\n');
     process.exit(1);
   }
-  if (state.versions.includes(pkg.version)) {
+  if (state.versions.includes(pkg.version) || state.pending.some((publish) => publish.version === pkg.version)) {
     process.stderr.write('npm error code EPUBLISHCONFLICT\n');
     process.exit(1);
   }
+  if (pkg.optionalDependencies) {
+    state.missingAtWrapperPublish = Object.values(pkg.optionalDependencies)
+      .map((spec) => spec.slice(spec.lastIndexOf('@') + 1))
+      .filter((version) => !state.versions.includes(version));
+  }
   const tagIndex = args.indexOf('--tag');
-  state.versions.push(pkg.version);
-  state.distTags[tagIndex === -1 ? 'latest' : args[tagIndex + 1]] = pkg.version;
-  if (process.env.FAKE_NPM_CLOBBER_LATEST === '1') state.distTags.latest = pkg.version;
+  const publish = { version: pkg.version, tag: tagIndex === -1 ? 'latest' : args[tagIndex + 1], wait: Number(process.env.FAKE_NPM_APPLY_AFTER || 0) };
+  if (publish.wait > 0) state.pending.push(publish);
+  else apply(publish);
   save();
   process.exit(0);
 }
@@ -88,6 +107,9 @@ type fakeRegistryState struct {
 	DistTags map[string]string `json:"distTags"`
 	// VersionLookups counts `npm view <name>@<version> version` calls.
 	VersionLookups int `json:"versionLookups,omitempty"`
+	// MissingAtWrapperPublish lists the platform versions the wrapper aliased
+	// that npm did not show yet when the wrapper was published.
+	MissingAtWrapperPublish []string `json:"missingAtWrapperPublish,omitempty"`
 }
 
 type npmCall struct {
@@ -323,5 +345,89 @@ func TestPublishPackagesFailsWhenTheRegistryCannotBeReached(t *testing.T) {
 	}
 	if !strings.Contains(run.stderr, "could not look up") || !strings.Contains(run.stderr, "ECONNRESET") {
 		t.Fatalf("stderr does not explain the failure or show npm's error: %s", run.stderr)
+	}
+}
+
+// npm accepts an upload and shows the version minutes later (ten minutes for a
+// 0.10.0 platform payload). Publishing the wrapper as soon as the platform
+// uploads return would leave installs resolving aliases that 404, and checking
+// `latest` right after the wrapper upload reports a failure that is not one.
+func TestPublishPackagesWaitsForNpmToApplyEachPublish(t *testing.T) {
+	platforms := []string{"darwin-arm64", "linux-x64"}
+	npmDir := writePublishFixture(t, platforms, platforms)
+	run := runPublishPackages(t, npmDir, fakeRegistryState{Name: publishFixtureName}, "FAKE_NPM_APPLY_AFTER=8")
+	if run.exitCode != 0 {
+		t.Fatalf("exit = %d while npm applied the publishes late; stdout=%s stderr=%s", run.exitCode, run.stdout, run.stderr)
+	}
+	if len(run.state.MissingAtWrapperPublish) != 0 {
+		t.Fatalf("the wrapper went out while npm did not show %v yet; installs would resolve aliases that 404", run.state.MissingAtWrapperPublish)
+	}
+	if latest := run.state.DistTags["latest"]; latest != publishFixtureVersion {
+		t.Fatalf("latest = %q, want %q", latest, publishFixtureVersion)
+	}
+}
+
+// A publish npm never applies must fail the job at the deadline, before the
+// wrapper goes out, instead of waiting forever.
+func TestPublishPackagesGivesUpWhenNpmNeverAppliesAPublish(t *testing.T) {
+	platforms := []string{"linux-x64"}
+	npmDir := writePublishFixture(t, platforms, platforms)
+	run := runPublishPackages(t, npmDir, fakeRegistryState{Name: publishFixtureName},
+		"FAKE_NPM_APPLY_AFTER=1000000", "ZERO_NPM_PUBLISH_WAIT_TIMEOUT=1")
+	if run.exitCode == 0 {
+		t.Fatalf("exit = 0 although npm never showed the platform version; stdout=%s", run.stdout)
+	}
+	if got := strings.Join(run.publishedDirs(), ","); got != "zero-linux-x64" {
+		t.Fatalf("published %s, want only the platform payload (the wrapper must wait for it)", got)
+	}
+	if !strings.Contains(run.stderr, "still does not show "+publishFixtureName+"@"+publishFixtureVersion+"-linux-x64") {
+		t.Fatalf("stderr does not say what npm never showed: %s", run.stderr)
+	}
+}
+
+// Bash arithmetic reads a leading zero as octal and rejects 08 outright, so
+// the timeout has to be converted explicitly rather than used as typed. The
+// rejection does not stop a script: it prints an error, leaves the deadline
+// unset and carries on, so the failure only shows once the script has to wait,
+// after the platform payloads are out. npm applying late makes it wait here.
+func TestPublishPackagesReadsTheWaitTimeoutAsDecimal(t *testing.T) {
+	platforms := []string{"linux-x64"}
+	npmDir := writePublishFixture(t, platforms, platforms)
+	run := runPublishPackages(t, npmDir, fakeRegistryState{Name: publishFixtureName},
+		"ZERO_NPM_PUBLISH_WAIT_TIMEOUT=08", "FAKE_NPM_APPLY_AFTER=3")
+	if run.exitCode != 0 {
+		t.Fatalf("exit = %d with ZERO_NPM_PUBLISH_WAIT_TIMEOUT=08; stdout=%s stderr=%s", run.exitCode, run.stdout, run.stderr)
+	}
+	if got := strings.Join(run.publishedDirs(), ","); got != "zero-linux-x64,wrapper" {
+		t.Fatalf("published %s, want zero-linux-x64,wrapper", got)
+	}
+}
+
+// A setting the script cannot use must stop it before anything is published:
+// a negative timeout would otherwise end the wait before it starts, and a bad
+// delay would only fail at the first sleep, after the platform payloads.
+func TestPublishPackagesRejectsAnInvalidWaitSetting(t *testing.T) {
+	for _, tc := range []struct{ variable, value string }{
+		{"ZERO_NPM_PUBLISH_WAIT_TIMEOUT", "-5"},
+		{"ZERO_NPM_PUBLISH_WAIT_TIMEOUT", "abc"},
+		{"ZERO_NPM_PUBLISH_WAIT_TIMEOUT", "1e3"},
+		{"ZERO_NPM_PUBLISH_WAIT_TIMEOUT", "86401"},
+		{"ZERO_NPM_PUBLISH_WAIT_TIMEOUT", "9999999999999999999999"},
+		{"ZERO_NPM_PUBLISH_RETRY_DELAY", "soon"},
+	} {
+		t.Run(tc.variable+"="+tc.value, func(t *testing.T) {
+			platforms := []string{"linux-x64"}
+			npmDir := writePublishFixture(t, platforms, platforms)
+			run := runPublishPackages(t, npmDir, fakeRegistryState{Name: publishFixtureName}, tc.variable+"="+tc.value)
+			if run.exitCode == 0 {
+				t.Fatalf("exit = 0 with %s=%s; stdout=%s", tc.variable, tc.value, run.stdout)
+			}
+			if len(run.publishes) != 0 {
+				t.Fatalf("published %v before rejecting %s=%s, want nothing", run.publishedDirs(), tc.variable, tc.value)
+			}
+			if !strings.Contains(run.stderr, tc.variable) {
+				t.Fatalf("stderr does not name %s: %s", tc.variable, run.stderr)
+			}
+		})
 	}
 }
