@@ -42,8 +42,9 @@ var fileWriteTempWrite = func(file *os.File, content string) error {
 //
 // Both publishes are atomic against a concurrent reader: the replacement bytes
 // are written whole to a side file in the target's directory and the target is
-// swapped wholesale. A create publishes through an exclusive link, so losing
-// that link refuses instead of replacing the raced file; an overwrite
+// swapped wholesale. A create reserves the name with the exclusive create it
+// has always honored and hands it the finished bytes in one rename, so losing
+// that reservation refuses instead of replacing the raced file; an overwrite
 // publishes through a rename, which hands the path over in one step. A failure
 // at any point before the publish removes the side file and leaves the
 // observed bytes standing — the caller's file outlives a write that could not
@@ -105,20 +106,64 @@ func commitRootedFileContents(root *os.Root, absolutePath, relativePath string, 
 }
 
 // commitRootedFileCreate publishes a brand-new file whose absence the caller
-// observed: the bytes are written to a side file beside the target, which an
-// exclusive link then attaches at the path without ever replacing anything.
-// A race that creates the target first is refused with the exclusive open's
-// own error, and a parent swapped for a symlink that escapes the workspace
-// between validation and the publish is refused by the kernel, both the same
-// way the exclusive create open they replace was.
+// observed. Nothing the caller's request produces is ever written to the
+// target's bytes in pieces: the name is reserved first with the exclusive
+// create this path has always honored — empty, refusing to replace a file the
+// race between observation and publication created, and receiving from the
+// kernel the permission bits the mode and the process umask together grant —
+// and the finished bytes are staged on a private side file beside the target
+// that the reserved name is then handed in one rename. A concurrent reader
+// sees the absent file, the empty reservation, or the whole file.
 func commitRootedFileCreate(root *os.Root, relativePath, content string) error {
-	tempName, err := writeRootedSideFile(root, relativePath, 0o644, content)
+	tempName, err := writeRootedSideFile(root, relativePath, 0o600, content)
 	if err != nil {
 		return err
 	}
-	if _, err := publishStructuredPatchNoReplace(root, tempName, relativePath, 0o644); err != nil {
+	reserved, err := root.OpenFile(relativePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
 		_ = removeWriteSideFile(root, tempName)
-		return err
+		return fmt.Errorf("creating %s: %w", relativePath, err)
+	}
+	reservedInfo, err := reserved.Stat()
+	if err != nil {
+		_ = reserved.Close()
+		// The reservation's identity could not be captured, so the reserved
+		// name cannot be proved to be this call's own empty file and is left
+		// alone; the failure is reported either way and the side file is
+		// always removed.
+		_ = removeWriteSideFile(root, tempName)
+		return fmt.Errorf("creating %s: %w", relativePath, err)
+	}
+	discard := func(cause error) error {
+		_ = reserved.Close()
+		joined := []error{cause, removeWriteSideFile(root, tempName)}
+		// The reservation is this call's artifact only while the name still
+		// resolves to the file it opened; a name carrying something else
+		// belongs to the hand that swapped it in and is not touched.
+		pathInfo, statErr := root.Stat(relativePath)
+		if statErr == nil && os.SameFile(reservedInfo, pathInfo) {
+			if cleanupErr := removeWriteSideFile(root, relativePath); cleanupErr != nil {
+				joined = append(joined, fmt.Errorf("removing the reserved empty file: %w", cleanupErr))
+			}
+		}
+		return fmt.Errorf("creating %s: %w", relativePath, errors.Join(joined...))
+	}
+	if err := reserved.Close(); err != nil {
+		return discard(err)
+	}
+	// The reserved create just told us the permissions the kernel granted the
+	// name for this process; publishing them, instead of assigning the mode
+	// outright, keeps a process umask as effective as it was for the exclusive
+	// create this step replaces.
+	if err := root.Chmod(tempName, reservedInfo.Mode().Perm()); err != nil {
+		return discard(err)
+	}
+	pathInfo, err := root.Stat(relativePath)
+	if err != nil || !os.SameFile(reservedInfo, pathInfo) {
+		return discard(errFileChangedDuringWrite)
+	}
+	if err := root.Rename(tempName, relativePath); err != nil {
+		return discard(err)
 	}
 	return nil
 }
