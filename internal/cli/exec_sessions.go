@@ -6,9 +6,9 @@ import (
 	"io"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/agent"
-	"github.com/Gitlawb/zero/internal/sessions"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/agent"
+	"github.com/Twigpine/zero/internal/sessions"
+	"github.com/Twigpine/zero/internal/tools"
 )
 
 type execSessionRecorder struct {
@@ -72,8 +72,11 @@ func preflightExecSession(options execOptions) error {
 		if session == nil {
 			return execUsageError{"Zero session not found: " + options.resume}
 		}
+		if !sessions.IsResumableKind(session.SessionKind) {
+			return execUsageError{"Zero session is not resumable: " + options.resume}
+		}
 	case options.resumeLatest:
-		latest, err := store.Latest()
+		latest, err := store.LatestResumable()
 		if err != nil {
 			return err
 		}

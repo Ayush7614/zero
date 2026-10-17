@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/sandbox"
 )
 
 func TestRunSandboxGrantsAllowListDenyRevokeAndClear(t *testing.T) {
@@ -483,14 +485,105 @@ func TestTUISandboxSetupCommandGatedToWindowsNativeBackend(t *testing.T) {
 }
 
 func TestRunSandboxPolicyJSONGoldenIncludesManagerBaselineFields(t *testing.T) {
-	// Point HOME at an empty directory so the default credential-store
-	// deny-read entries (which depend on what exists in the real home, e.g.
-	// ~/.aws on the macOS CI image) cannot leak host paths into the golden
-	// comparison.
+	// Pin before any t.TempDir so an ambient temp dir cannot reach the snapshot.
+	// Unix reads TMPDIR (and always considers /tmp). Windows reads TEMP and TMP.
+	// XDG_RUNTIME_DIR is not a temp write-root candidate.
+	pinSandboxPolicyGoldenTempEnv(t)
+	assertSandboxPolicyJSONGolden(t, "")
+}
+
+// TestRunSandboxPolicyJSONGoldenNestedTempDir stages the temp-dir shape from
+// #1121 and then pins over it. On Unix that shape is a TMPDIR inside /tmp; on
+// Windows it is TMP inside TEMP. NewScope drops the inner root, the policy
+// JSON still lists it, and the golden normalizer leaves it behind. The pin
+// replaces those variables before the snapshot, so the golden matches and the
+// nested path does not survive. The directories come from t.TempDir, never
+// from the package working directory, so a checkout under /tmp is not special.
+func TestRunSandboxPolicyJSONGoldenNestedTempDir(t *testing.T) {
+	nested := stageNestedSandboxTempEnv(t)
+	pinSandboxPolicyGoldenTempEnv(t)
+	normalized := assertSandboxPolicyJSONGolden(t, "")
+	if strings.Contains(normalized, nested) || strings.Contains(normalized, filepath.ToSlash(nested)) {
+		t.Fatalf("normalized policy leaked nested temp root %q:\n%s", nested, normalized)
+	}
+}
+
+// stageNestedSandboxTempEnv installs the leaking temp-dir shape and returns
+// the inner path. The caller pins afterward. Skip, rather than fail, when
+// that shape cannot be built.
+func stageNestedSandboxTempEnv(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		outer := t.TempDir()
+		inner := filepath.Join(outer, "inner")
+		if err := os.MkdirAll(inner, 0o755); err != nil {
+			t.Skipf("create nested TEMP/TMP: %v", err)
+		}
+		t.Setenv("TEMP", outer)
+		t.Setenv("TMP", inner)
+		return inner
+	}
+	resolvedTmp, err := filepath.EvalSymlinks("/tmp")
+	if err != nil {
+		t.Skipf("resolve /tmp: %v", err)
+	}
+	info, err := os.Stat(resolvedTmp)
+	if err != nil || !info.IsDir() {
+		t.Skip("/tmp is not a directory; cannot stage a nested TMPDIR")
+	}
+	// t.TempDir is a child of os.TempDir(). A further child is the ambient
+	// case: TMPDIR inside the hard-coded /tmp candidate.
+	nested := filepath.Join(t.TempDir(), "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Skipf("create nested TMPDIR: %v", err)
+	}
+	resolvedNested, err := filepath.EvalSymlinks(nested)
+	if err != nil {
+		t.Skipf("resolve nested TMPDIR: %v", err)
+	}
+	rel, err := filepath.Rel(resolvedTmp, resolvedNested)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		t.Skipf("temp dir %q is not inside /tmp; cannot stage the nested TMPDIR case", resolvedNested)
+	}
+	t.Setenv("TMPDIR", resolvedNested)
+	return resolvedNested
+}
+
+// pinSandboxPolicyGoldenTempEnv fixes the temp variables
+// defaultTempWriteRootCandidatesForGOOS reads so the golden does not depend on
+// the process environment. An empty TMPDIR leaves the Unix hard-coded /tmp as
+// the only candidate. TEMP and TMP name one directory so neither is nested in
+// the other.
+func pinSandboxPolicyGoldenTempEnv(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		dir := t.TempDir()
+		t.Setenv("TEMP", dir)
+		t.Setenv("TMP", dir)
+		return
+	}
+	t.Setenv("TMPDIR", "")
+}
+
+func assertSandboxPolicyJSONGolden(t *testing.T, mustList string) string {
+	t.Helper()
+	// Point all user-config roots at an empty directory so the platform-specific
+	// credential deny baseline can be asserted without leaking host paths into
+	// the platform-neutral golden comparison.
 	emptyHome := t.TempDir()
 	t.Setenv("HOME", emptyHome)
 	t.Setenv("USERPROFILE", emptyHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(emptyHome, ".config"))
+	t.Setenv("CLOUDSDK_CONFIG", "")
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	t.Setenv("NPM_CONFIG_USERCONFIG", "")
+	t.Setenv("npm_config_userconfig", "")
+	t.Setenv("GH_CONFIG_DIR", "")
+	t.Setenv("NETRC", "")
+	t.Setenv("DOCKER_CONFIG", "")
+	t.Setenv("KUBECONFIG", "")
+	t.Setenv("ZERO_OAUTH_TOKENS_PATH", "")
+	t.Setenv("ZERO_MCP_OAUTH_TOKENS_PATH", "")
 	store := newSandboxTestStore(t)
 	workspace := t.TempDir()
 	deps := appDeps{
@@ -515,10 +608,10 @@ func TestRunSandboxPolicyJSONGoldenIncludesManagerBaselineFields(t *testing.T) {
 		t.Fatalf("policy exit = %d, stderr %q", exitCode, stderr.String())
 	}
 
-	got := stdout.String()
-	got = replacePathToken(got, workspace, "$WORKSPACE")
+	raw := stdout.String()
+	got := replacePathToken(raw, workspace, "$WORKSPACE")
 	got = replacePathToken(got, store.FilePath(), "$GRANTS")
-	gotBytes := normalizeSandboxPolicyGoldenTempRoots(t, []byte(got), workspace)
+	gotBytes := normalizeSandboxPolicyGoldenTempRoots(t, []byte(got), workspace, emptyHome)
 	wantBytes, err := os.ReadFile(filepath.Join("testdata", "sandbox_policy_windows_unavailable.golden.json"))
 	if err != nil {
 		t.Fatalf("read golden: %v", err)
@@ -526,9 +619,13 @@ func TestRunSandboxPolicyJSONGoldenIncludesManagerBaselineFields(t *testing.T) {
 	if !jsonValuesEqual(t, wantBytes, gotBytes) {
 		t.Fatalf("policy JSON golden mismatch\nwant:\n%s\ngot:\n%s", string(wantBytes), string(gotBytes))
 	}
+	if mustList != "" && !strings.Contains(raw, mustList) {
+		t.Fatalf("policy JSON did not list pinned temp root %q\n%s", mustList, raw)
+	}
+	return string(gotBytes)
 }
 
-func normalizeSandboxPolicyGoldenTempRoots(t *testing.T, gotBytes []byte, workspace string) []byte {
+func normalizeSandboxPolicyGoldenTempRoots(t *testing.T, gotBytes []byte, workspace string, emptyHome string) []byte {
 	t.Helper()
 	scope, err := sandbox.NewScope(workspace, nil)
 	if err != nil {
@@ -549,6 +646,56 @@ func normalizeSandboxPolicyGoldenTempRoots(t *testing.T, gotBytes []byte, worksp
 	plan, _ := value.(map[string]any)["plan"].(map[string]any)
 	profile, _ := plan["permissionProfile"].(map[string]any)
 	fileSystem, _ := profile["fileSystem"].(map[string]any)
+	wantDenyRead := []string(nil)
+	credentialHome := emptyHome
+	if runtime.GOOS != "windows" {
+		if resolved, err := filepath.EvalSymlinks(emptyHome); err == nil {
+			credentialHome = resolved
+		}
+		wantDenyRead = []string{
+			filepath.Join(credentialHome, ".aws"),
+			filepath.Join(credentialHome, ".azure"),
+			// git's cleartext credential stores, in both the home and XDG
+			// layouts (#816). Listed here so the exported policy JSON is what
+			// catches a regression: this baseline is the contract a user reads
+			// with `zero sandbox policy --json`.
+			filepath.Join(credentialHome, ".git-credentials"),
+			filepath.Join(credentialHome, ".config", "git", "credentials"),
+			filepath.Join(credentialHome, ".npmrc"),
+			filepath.Join(credentialHome, ".netrc"),
+			filepath.Join(credentialHome, ".kube", "config"),
+			filepath.Join(credentialHome, ".docker", "config.json"),
+			filepath.Join(credentialHome, ".config", "gh", "hosts.yml"),
+			filepath.Join(credentialHome, ".config", "gcloud"),
+			filepath.Join(credentialHome, ".config", "zero"),
+		}
+	}
+	gotDenyRead := jsonStringSlice(fileSystem["denyReadIfExists"])
+	sort.Strings(gotDenyRead)
+	sort.Strings(wantDenyRead)
+	if !reflect.DeepEqual(gotDenyRead, wantDenyRead) {
+		t.Fatalf("manager credential deny baseline = %#v, want %#v", gotDenyRead, wantDenyRead)
+	}
+	wantCarveouts := []string(nil)
+	wantEnsureDirs := []string(nil)
+	if runtime.GOOS != "windows" {
+		zeroDir := filepath.Join(credentialHome, ".config", "zero")
+		wantCarveouts = []string{
+			filepath.Join(zeroDir, "plugins"),
+			filepath.Join(zeroDir, "specialists"),
+			filepath.Join(zeroDir, "commands"),
+		}
+		wantEnsureDirs = []string{zeroDir}
+	}
+	if gotCarveouts := jsonStringSlice(fileSystem["denyReadCarveouts"]); !reflect.DeepEqual(gotCarveouts, wantCarveouts) {
+		t.Fatalf("manager credential carveouts = %#v, want %#v", gotCarveouts, wantCarveouts)
+	}
+	if gotEnsureDirs := jsonStringSlice(fileSystem["ensureDenyReadDirs"]); !reflect.DeepEqual(gotEnsureDirs, wantEnsureDirs) {
+		t.Fatalf("manager credential ensure dirs = %#v, want %#v", gotEnsureDirs, wantEnsureDirs)
+	}
+	delete(fileSystem, "denyReadIfExists")
+	delete(fileSystem, "denyReadCarveouts")
+	delete(fileSystem, "ensureDenyReadDirs")
 	fileSystem["readRoots"] = filterJSONStringRoots(fileSystem["readRoots"], tempRoots)
 	fileSystem["writeRoots"] = filterJSONWriteRoots(fileSystem["writeRoots"], tempRoots)
 	normalized, err := json.MarshalIndent(value, "", "  ")
@@ -556,6 +703,22 @@ func normalizeSandboxPolicyGoldenTempRoots(t *testing.T, gotBytes []byte, worksp
 		t.Fatalf("encode normalized policy JSON: %v", err)
 	}
 	return append(normalized, '\n')
+}
+
+func jsonStringSlice(value any) []string {
+	values, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			return nil
+		}
+		out = append(out, text)
+	}
+	return out
 }
 
 func filterJSONStringRoots(value any, excluded map[string]struct{}) any {
@@ -720,7 +883,8 @@ func TestRunSandboxPolicyEffectiveTextAndJSON(t *testing.T) {
 				Network            bool `json:"network"`
 				Workspace          bool `json:"workspace"`
 			} `json:"guards"`
-			GrantsPath string `json:"grantsPath"`
+			GrantsPath            string `json:"grantsPath"`
+			PermissionProfileNote string `json:"permissionProfileNote"`
 		}
 		if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 			t.Fatalf("decode effective JSON: %v\n%s", err, stdout.String())
@@ -737,6 +901,9 @@ func TestRunSandboxPolicyEffectiveTextAndJSON(t *testing.T) {
 		if payload.Plan.SupportLevel != string(sandbox.BackendSupportUnavailable) || payload.GrantsPath == "" {
 			t.Fatalf("unexpected effective plan/grants: %#v %q", payload.Plan, payload.GrantsPath)
 		}
+		if payload.PermissionProfileNote != permissionProfileScopeNote {
+			t.Fatalf("permissionProfileNote = %q, want %q", payload.PermissionProfileNote, permissionProfileScopeNote)
+		}
 	})
 }
 
@@ -747,6 +914,9 @@ func TestEffectiveSandboxPolicyListsWriteRoots(t *testing.T) {
 	}
 	if !strings.Contains(output, "enforce_workspace: true\nwrite_roots: /ws, /extra") {
 		t.Fatalf("write_roots should directly follow enforce_workspace, got:\n%s", output)
+	}
+	if !strings.Contains(output, "permission_profile_note: "+permissionProfileScopeNote) {
+		t.Fatalf("effective text missing permission profile scope warning:\n%s", output)
 	}
 	if strings.Contains(output, "write_roots_error") {
 		t.Fatalf("unexpected write_roots_error line without an error:\n%s", output)
@@ -1000,4 +1170,19 @@ func sandboxPolicyCapabilityStatus(capabilities []sandbox.BackendCapability, key
 		}
 	}
 	return ""
+}
+
+func TestApplyConfiguredSandboxPolicyEnabledFalseDisables(t *testing.T) {
+	disabled := false
+	if got := applyConfiguredSandboxPolicy(sandbox.DefaultPolicy(), config.SandboxConfig{Enabled: &disabled}); got.Mode != sandbox.ModeDisabled {
+		t.Fatalf("enabled:false must yield ModeDisabled, got %q", got.Mode)
+	}
+	// Omitted (nil) and explicit true keep the default enforcing mode.
+	if got := applyConfiguredSandboxPolicy(sandbox.DefaultPolicy(), config.SandboxConfig{}); got.Mode == sandbox.ModeDisabled {
+		t.Fatal("omitted enabled must not disable the sandbox")
+	}
+	enabled := true
+	if got := applyConfiguredSandboxPolicy(sandbox.DefaultPolicy(), config.SandboxConfig{Enabled: &enabled}); got.Mode == sandbox.ModeDisabled {
+		t.Fatal("enabled:true must not disable the sandbox")
+	}
 }

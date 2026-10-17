@@ -13,8 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/redaction"
-	zeroSandbox "github.com/Gitlawb/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/proxydial"
+	"github.com/Twigpine/zero/internal/redaction"
+	zeroSandbox "github.com/Twigpine/zero/internal/sandbox"
 )
 
 const (
@@ -99,10 +100,6 @@ func NewWebFetchTool() Tool {
 	return newWebFetchToolWithClientAndResolver(nil, defaultWebFetchResolver{})
 }
 
-func newWebFetchToolWithClient(client *http.Client) Tool {
-	return newWebFetchToolWithClientAndResolver(client, nil)
-}
-
 func newWebFetchToolWithClientAndResolver(client *http.Client, resolver webFetchResolver) Tool {
 	if client == nil {
 		client = &http.Client{Timeout: webFetchTimeout}
@@ -111,6 +108,7 @@ func newWebFetchToolWithClientAndResolver(client *http.Client, resolver webFetch
 		baseTool: baseTool{
 			name:        "web_fetch",
 			description: "Fetch text from a public remote HTTP or HTTPS URL after network permission is granted. Do not use for localhost, private network URLs, or local dev servers; use bash with curl for those.",
+			deferred:    true,
 			parameters: Schema{
 				Type: "object",
 				Properties: map[string]PropertySchema{
@@ -141,6 +139,11 @@ func newWebFetchToolWithClientAndResolver(client *http.Client, resolver webFetch
 				Reason:          "Fetches remote URL content over the network.",
 				AdvertiseInAuto: true,
 			},
+			// Concurrent-safe: net/http.Client is documented as safe for
+			// concurrent use; each call issues independent request I/O.
+			// parallelSafeToolCall still requires PermissionAllow (prompted
+			// network fetches stay sequential until auto-allowed).
+			capabilities: ToolCapabilities{Effect: EffectReadOnly, ThreadSafe: true, ResourceKeys: endpointResourceKeys},
 		},
 		client:   client,
 		resolver: resolver,
@@ -306,19 +309,48 @@ func webFetchSafeTransport(roundTripper http.RoundTripper, resolver webFetchReso
 		transport = http.DefaultTransport.(*http.Transport).Clone()
 	case *http.Transport:
 		transport = typed.Clone()
+	case *proxydial.Transport:
+		// Already guarded: rebuild from the inner transport so a second pass
+		// installs one dialer rather than nesting wrappers.
+		transport = typed.Transport.Clone()
 	default:
 		return roundTripper
 	}
 
 	dialer := &net.Dialer{Timeout: webFetchTimeout, KeepAlive: 30 * time.Second}
-	transport.Proxy = nil
+	// THE PROXY IS HONOURED, AND THAT IS A DELIBERATE REVERSAL. The original
+	// guarded fetch set Proxy to nil as part of tightening the SSRF guardrails,
+	// and the reasoning was sound as far as it went: a proxied request is dialed
+	// to the proxy, so the dial-time address pin below never sees the target and
+	// the DNS-rebind protection it provides does not apply. What that traded away
+	// was every fetch on a machine that reaches the network only through a
+	// configured proxy, which fails outright rather than degrades (#569).
+	//
+	// The target is still validated before the request is made, lexically and
+	// through the resolver, with the same block list the dialer applies. What a
+	// forward proxy removes is only the re-check at dial time, and that is
+	// inherent to using any forward proxy; a user who sets HTTPS_PROXY has chosen
+	// it.
+	//
+	// The returned round tripper is wrapped so the dialer learns which route
+	// the transport chose for each request: the one dial it lets past the guard
+	// is the one this transport opens to the proxy it picked for that request.
+	transport.Proxy = http.ProxyFromEnvironment
 	transport.DialContext = webFetchSafeDialContext(resolver, dialer)
 	transport.DialTLSContext = nil
-	return transport
+	return proxydial.Wrap(transport)
 }
 
 func webFetchSafeDialContext(resolver webFetchResolver, dialer webFetchDialer) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		// The proxy is not the target. See webFetchSafeTransport for why the
+		// proxy is honoured at all; here, the dial the transport opens to the
+		// proxy it selected for this request skips the pin, and nothing else
+		// does. A direct dial is pinned as it always was, including one whose
+		// address happens to equal a configured proxy endpoint.
+		if proxydial.IsProxyDial(ctx) {
+			return dialer.DialContext(ctx, network, address)
+		}
 		pinnedAddress, err := webFetchSafeDialAddress(ctx, resolver, address)
 		if err != nil {
 			return nil, err

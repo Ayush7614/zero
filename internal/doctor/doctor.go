@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/oauth"
-	"github.com/Gitlawb/zero/internal/providerhealth"
-	"github.com/Gitlawb/zero/internal/redaction"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/oauth"
+	"github.com/Twigpine/zero/internal/providerhealth"
+	"github.com/Twigpine/zero/internal/redaction"
 )
 
 type Status string
@@ -142,9 +142,10 @@ func providerConfigCheck(profile config.ProviderProfile) Check {
 		return check("provider.config", "Provider config", StatusFail, "No LLM provider is configured.", map[string]any{"help": "Set a provider in config or environment."})
 	}
 	// Report credential PRESENCE, never the value. Reported under a non-sensitive
-	// key ("credentialConfigured"): the prior "apiKey" key was itself sensitive, so
-	// check()'s redaction scrubbed the indicator to [REDACTED] — making "set"/"not
-	// set" invisible. HasConfiguredCredential is the shared definition of
+	// key ("authConfigured"): "apiKey" and "credentialConfigured" are themselves
+	// sensitive after camelCase normalization, so check()'s redaction would scrub
+	// the indicator to [REDACTED] — making "set"/"not set" invisible.
+	// HasConfiguredCredential is the shared definition of
 	// "key-authed" (inline key, raw auth header, or a key in the encrypted
 	// credential store), matching ProviderSnapshot.APIKeySet — checking only the
 	// inline fields made doctor and `zero providers list` disagree about the
@@ -159,11 +160,11 @@ func providerConfigCheck(profile config.ProviderProfile) Check {
 		credential = "oauth login"
 	}
 	details := map[string]any{
-		"name":                 profile.Name,
-		"provider":             profile.ProviderKind,
-		"baseURL":              profile.BaseURL,
-		"model":                profile.Model,
-		"credentialConfigured": credential,
+		"name":           profile.Name,
+		"provider":       profile.ProviderKind,
+		"baseURL":        profile.BaseURL,
+		"model":          profile.Model,
+		"authConfigured": credential,
 	}
 	// A remote provider with no credential cannot make a request, so doctor must NOT
 	// report it as healthy — otherwise "Overall: pass" gives a false all-clear for the

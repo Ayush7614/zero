@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/sandbox"
 )
 
 // denyReadFixture builds a workspace with an ordinary file and a secret subtree,
@@ -48,7 +48,7 @@ func denyReadFixture(t *testing.T) (string, *sandbox.Engine) {
 
 func TestGrepSkipsDenyReadSubtree(t *testing.T) {
 	ws, engine := denyReadFixture(t)
-	tool, ok := NewGrepTool(ws).(sandboxAwareTool)
+	tool, ok := NewScopedGrepTool(ws, nil).(sandboxAwareTool)
 	if !ok {
 		t.Fatal("grep tool must be sandbox-aware")
 	}
@@ -67,7 +67,7 @@ func TestGrepSkipsDenyReadSubtree(t *testing.T) {
 	}
 
 	// Without a sandbox, the same search includes the secret file (default behavior).
-	plain := NewGrepTool(ws).Run(context.Background(), args)
+	plain := NewScopedGrepTool(ws, nil).Run(context.Background(), args)
 	if !strings.Contains(plain.Output, "creds.go") {
 		t.Fatalf("non-sandboxed grep should include the secret file, got:\n%s", plain.Output)
 	}
@@ -75,7 +75,7 @@ func TestGrepSkipsDenyReadSubtree(t *testing.T) {
 
 func TestGlobSkipsDenyReadSubtree(t *testing.T) {
 	ws, engine := denyReadFixture(t)
-	tool, ok := NewGlobTool(ws).(sandboxAwareTool)
+	tool, ok := NewScopedGlobTool(ws, nil).(sandboxAwareTool)
 	if !ok {
 		t.Fatal("glob tool must be sandbox-aware")
 	}
@@ -92,7 +92,7 @@ func TestGlobSkipsDenyReadSubtree(t *testing.T) {
 		t.Fatalf("glob must NOT surface a DenyRead file, got:\n%s", sandboxed.Output)
 	}
 
-	plain := NewGlobTool(ws).Run(context.Background(), args)
+	plain := NewScopedGlobTool(ws, nil).Run(context.Background(), args)
 	if !strings.Contains(plain.Output, "creds.go") {
 		t.Fatalf("non-sandboxed glob should include the secret file, got:\n%s", plain.Output)
 	}

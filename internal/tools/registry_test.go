@@ -2,12 +2,15 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/sandbox"
 )
 
 func tempDirOutsideDefaultTemp(t *testing.T) string {
@@ -28,9 +31,9 @@ func tempDirOutsideDefaultTemp(t *testing.T) string {
 }
 
 func TestCoreReadOnlyToolsExposeSafeMetadata(t *testing.T) {
-	toolset := CoreReadOnlyTools(t.TempDir())
-	if len(toolset) != 9 {
-		t.Fatalf("expected 9 core read-only tools, got %d", len(toolset))
+	toolset := CoreReadOnlyToolsScoped(t.TempDir(), nil)
+	if len(toolset) != 10 {
+		t.Fatalf("expected 10 core read-only tools, got %d", len(toolset))
 	}
 
 	seen := map[string]bool{}
@@ -70,6 +73,103 @@ func TestCoreReadOnlyToolsExposeSafeMetadata(t *testing.T) {
 	if !seen[RequestPermissionsToolName] {
 		t.Fatalf("expected %s in core read-only tools", RequestPermissionsToolName)
 	}
+	// By name as well as by count: the count alone still passes if one reader is
+	// swapped for another.
+	if !seen[ViewImageToolName] {
+		t.Fatalf("expected %s in core read-only tools", ViewImageToolName)
+	}
+}
+
+func TestRegistryAllReturnsToolsSortedByName(t *testing.T) {
+	registry := NewRegistry()
+	for _, name := range []string{"write_file", "bash", "read_file"} {
+		registry.Register(fakePlainTool{baseTool: baseTool{name: name, description: name}})
+	}
+
+	all := registry.All()
+	got := make([]string, 0, len(all))
+	for _, tool := range all {
+		got = append(got, tool.Name())
+	}
+	want := []string{"bash", "read_file", "write_file"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Registry.All() order = %v, want %v", got, want)
+	}
+}
+
+func TestRegistrySnapshotAndCloneStayOnOneGeneration(t *testing.T) {
+	registry := NewRegistry()
+	registry.Register(fakePlainTool{baseTool: baseTool{name: "alpha", description: "alpha"}})
+	first := registry.Snapshot()
+
+	registry.RegisterBatch([]Tool{
+		fakePlainTool{baseTool: baseTool{name: "charlie", description: "charlie"}},
+		fakePlainTool{baseTool: baseTool{name: "bravo", description: "bravo"}},
+	})
+	second := registry.Snapshot()
+	clone := registry.Clone()
+	registry.Register(fakePlainTool{baseTool: baseTool{name: "delta", description: "delta"}})
+
+	if got := toolNames(first.Tools); !slices.Equal(got, []string{"alpha"}) {
+		t.Fatalf("first snapshot changed after registration: %v", got)
+	}
+	if second.Generation != first.Generation+1 {
+		t.Fatalf("batch generation = %d, want %d", second.Generation, first.Generation+1)
+	}
+	if got := toolNames(second.Tools); !slices.Equal(got, []string{"alpha", "bravo", "charlie"}) {
+		t.Fatalf("second snapshot tools = %v", got)
+	}
+	if got := toolNames(clone.All()); !slices.Equal(got, toolNames(second.Tools)) {
+		t.Fatalf("clone changed with source registry: %v", got)
+	}
+	if clone.Snapshot().Generation != second.Generation {
+		t.Fatalf("clone generation = %d, want %d", clone.Snapshot().Generation, second.Generation)
+	}
+}
+
+func TestRegistryBatchIsAtomicForConcurrentReaders(t *testing.T) {
+	registry := NewRegistry()
+	registry.Register(fakePlainTool{baseTool: baseTool{name: "base", description: "base"}})
+	batch := make([]Tool, 128)
+	for index := range batch {
+		name := fmt.Sprintf("tool_%03d", index)
+		batch[index] = fakePlainTool{baseTool: baseTool{name: name, description: name}}
+	}
+
+	start := make(chan struct{})
+	done := make(chan struct{})
+	var readers sync.WaitGroup
+	for range 4 {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			<-start
+			for {
+				count := len(registry.Snapshot().Tools)
+				if count != 1 && count != len(batch)+1 {
+					t.Errorf("reader observed partial batch with %d tools", count)
+					return
+				}
+				select {
+				case <-done:
+					return
+				default:
+				}
+			}
+		}()
+	}
+	close(start)
+	registry.RegisterBatch(batch)
+	close(done)
+	readers.Wait()
+}
+
+func toolNames(toolset []Tool) []string {
+	names := make([]string, 0, len(toolset))
+	for _, tool := range toolset {
+		names = append(names, tool.Name())
+	}
+	return names
 }
 
 func TestCoreNetworkToolsExposeSafetyMetadata(t *testing.T) {
@@ -126,7 +226,7 @@ func TestCoreNetworkToolsOmitWebSearchWhenUnconfigured(t *testing.T) {
 }
 
 func TestCoreToolsIncludeWebFetchButReadOnlyToolsDoNot(t *testing.T) {
-	readOnly := CoreReadOnlyTools(t.TempDir())
+	readOnly := CoreReadOnlyToolsScoped(t.TempDir(), nil)
 	for _, tool := range readOnly {
 		if tool.Name() == "web_fetch" {
 			t.Fatal("web_fetch should not be exposed by read-only core tools")
@@ -134,7 +234,7 @@ func TestCoreToolsIncludeWebFetchButReadOnlyToolsDoNot(t *testing.T) {
 	}
 
 	found := false
-	for _, tool := range CoreTools(t.TempDir()) {
+	for _, tool := range CoreToolsScoped(t.TempDir(), nil) {
 		if tool.Name() == "web_fetch" {
 			found = true
 			break
@@ -147,7 +247,7 @@ func TestCoreToolsIncludeWebFetchButReadOnlyToolsDoNot(t *testing.T) {
 
 func TestRegistryRunsToolsThroughSafePath(t *testing.T) {
 	registry := NewRegistry()
-	registry.Register(NewReadFileTool(t.TempDir()))
+	registry.Register(NewScopedReadFileTool(t.TempDir(), nil))
 
 	result := registry.Run(context.Background(), "read_file", map[string]any{
 		"path": "missing.txt",
@@ -211,7 +311,7 @@ func TestRegistryAppliesSandboxBeforeToolExecution(t *testing.T) {
 	root := t.TempDir()
 	outside := filepath.Join(tempDirOutsideDefaultTemp(t), "escape.txt")
 	registry := NewRegistry()
-	registry.Register(NewWriteFileTool(root))
+	registry.Register(NewScopedWriteFileTool(root, nil))
 	engine := sandbox.NewEngine(sandbox.EngineOptions{
 		WorkspaceRoot: root,
 		Policy:        sandbox.DefaultPolicy(),
@@ -244,7 +344,7 @@ func TestRegistrySandboxGatesPathAliasKeys(t *testing.T) {
 		root := t.TempDir()
 		outside := filepath.Join(tempDirOutsideDefaultTemp(t), "escape.txt")
 		registry := NewRegistry()
-		registry.Register(NewWriteFileTool(root))
+		registry.Register(NewScopedWriteFileTool(root, nil))
 		engine := sandbox.NewEngine(sandbox.EngineOptions{WorkspaceRoot: root, Policy: sandbox.DefaultPolicy()})
 
 		result := registry.RunWithOptions(context.Background(), "write_file", map[string]any{
@@ -284,7 +384,7 @@ func TestRegistryAllowsPromptToolWithPersistentSandboxGrant(t *testing.T) {
 	}
 
 	registry := NewRegistry()
-	registry.Register(NewWriteFileTool(root))
+	registry.Register(NewScopedWriteFileTool(root, nil))
 	engine := sandbox.NewEngine(sandbox.EngineOptions{
 		WorkspaceRoot: root,
 		Policy:        sandbox.DefaultPolicy(),
@@ -345,12 +445,119 @@ func (t denyTool) Run(context.Context, map[string]any) Result { return Result{St
 // must be scrubbed too, not just the tool-execution paths.
 func TestScrubResultSecretsRedactsPreview(t *testing.T) {
 	secret := "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	res := scrubResultSecrets(Result{Display: Display{Preview: "+++ b/x\n+token := \"" + secret + "\""}})
+	res := scrubResultSecrets(Result{
+		Display:   Display{Preview: "+++ b/x\n+token := \"" + secret + "\""},
+		FileDiffs: []FileDiff{{Path: filepath.Join(t.TempDir(), "x"), OldExists: true, NewExists: true, OldText: "before " + secret, NewText: "after " + secret}},
+	})
 	if strings.Contains(res.Display.Preview, secret) {
 		t.Errorf("Display.Preview (the card-only code preview) must be redacted, leaked: %q", res.Display.Preview)
 	}
 	if !res.Redacted {
 		t.Error("scrubbing a secret from the preview should set Redacted")
+	}
+	if len(res.FileDiffs) != 1 || strings.Contains(res.FileDiffs[0].OldText, secret) || strings.Contains(res.FileDiffs[0].NewText, secret) {
+		t.Errorf("FileDiff must be redacted: %#v", res.FileDiffs)
+	}
+}
+
+func TestScrubResultSecretsDropsControlSplitFileDiff(t *testing.T) {
+	secret := "sk-proj-abcdefghijklmnopqrstuvwxyz"
+	res := scrubResultSecrets(Result{FileDiffs: []FileDiff{{
+		Path:      filepath.Join(t.TempDir(), "x"),
+		OldExists: true,
+		NewExists: true,
+		OldText:   "token=" + secret[:12] + "\x00" + secret[12:],
+		NewText:   "safe",
+	}}})
+	if len(res.FileDiffs) != 0 || !res.Redacted {
+		t.Fatalf("unsafe FileDiff = %#v, redacted = %t", res.FileDiffs, res.Redacted)
+	}
+}
+
+func TestScrubResultSecretsDropsDefaultIgnorableSplitFileDiffOnEitherSide(t *testing.T) {
+	secret := "sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGG"
+	for name, separator := range map[string]string{
+		"combining grapheme joiner": "\u034f",
+		"variation selector":        "\ufe0f",
+	} {
+		for _, side := range []string{"old", "new"} {
+			t.Run(name+" "+side, func(t *testing.T) {
+				obfuscated := secret[:20] + separator + secret[20:]
+				diff := FileDiff{
+					Path: filepath.Join(t.TempDir(), "x"), OldExists: true, NewExists: true,
+					OldText: "safe old", NewText: "safe new",
+				}
+				if side == "old" {
+					diff.OldText = obfuscated
+				} else {
+					diff.NewText = obfuscated
+				}
+				res := scrubResultSecrets(Result{FileDiffs: []FileDiff{diff}})
+				if len(res.FileDiffs) != 0 || !res.Redacted {
+					t.Fatalf("unsafe FileDiff = %#v, redacted = %t", res.FileDiffs, res.Redacted)
+				}
+			})
+		}
+	}
+}
+
+func TestScrubResultSecretsDoesNotMutateCallerFileDiffSlice(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x")
+	secret := "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	retainedOld := "before token=" + secret
+	retainedNew := "after token=" + secret
+	original := []FileDiff{
+		{Path: path, OldExists: true, NewExists: true, OldText: "token=sk-proj-abc\x00def", NewText: "unsafe"},
+		{Path: path, OldExists: true, NewExists: true, OldText: retainedOld, NewText: retainedNew},
+	}
+	result := scrubResultSecrets(Result{FileDiffs: original})
+	if len(result.FileDiffs) != 1 || strings.Contains(result.FileDiffs[0].OldText, secret) || strings.Contains(result.FileDiffs[0].NewText, secret) {
+		t.Fatalf("filtered FileDiffs = %#v", result.FileDiffs)
+	}
+	if original[0].NewText != "unsafe" || original[1].OldText != retainedOld || original[1].NewText != retainedNew {
+		t.Fatalf("caller slice was mutated: %#v", original)
+	}
+}
+
+func TestScrubResultSecretsDropsSemanticallyUnchangedRedactedDiff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.txt")
+	oldSecret := "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	newSecret := "ghp_9876543210ZYXWVUTSRQPONMLKJIHGFEDCBA"
+	result := scrubResultSecrets(Result{
+		ChangedFiles: []string{"credentials.txt"},
+		FileDiffs: []FileDiff{{
+			Path: path, OldExists: true, NewExists: true,
+			OldText: "token=" + oldSecret, NewText: "token=" + newSecret,
+		}},
+	})
+	if len(result.FileDiffs) != 0 {
+		t.Fatalf("semantically unchanged redacted diff = %#v", result.FileDiffs)
+	}
+	if got, want := result.ChangedFiles, []string{"credentials.txt"}; !slices.Equal(got, want) {
+		t.Fatalf("ChangedFiles = %#v, want %#v", got, want)
+	}
+	if !result.Redacted {
+		t.Fatal("credential rotation must set Redacted")
+	}
+}
+
+func TestScrubResultSecretsKeepsRealTransitionAroundRedactedSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.txt")
+	oldSecret := "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	newSecret := "ghp_9876543210ZYXWVUTSRQPONMLKJIHGFEDCBA"
+	result := scrubResultSecrets(Result{FileDiffs: []FileDiff{{
+		Path: path, OldExists: true, NewExists: true,
+		OldText: "environment=staging token=" + oldSecret,
+		NewText: "environment=production token=" + newSecret,
+	}}})
+	if len(result.FileDiffs) != 1 {
+		t.Fatalf("redacted real transition = %#v", result.FileDiffs)
+	}
+	if result.FileDiffs[0].OldText == result.FileDiffs[0].NewText {
+		t.Fatalf("redacted transition became unchanged: %#v", result.FileDiffs[0])
+	}
+	if strings.Contains(result.FileDiffs[0].OldText, oldSecret) || strings.Contains(result.FileDiffs[0].NewText, newSecret) {
+		t.Fatalf("redacted transition leaked a secret: %#v", result.FileDiffs[0])
 	}
 }
 
@@ -495,5 +702,45 @@ func TestIsDeferralEligibleDecouplesFromDeferred(t *testing.T) {
 	optedOut := fakeDeferredTool{baseTool: baseTool{name: "opted_out"}, deferred: false}
 	if IsDeferralEligible(optedOut) {
 		t.Fatal("IsDeferralEligible(optedOut) = true, want false")
+	}
+}
+
+func TestOptionalBuiltinsUseDeferredDiscovery(t *testing.T) {
+	wantDeferred := map[string]bool{
+		"bash":             true,
+		"browser_action":   true,
+		"browser_click":    true,
+		"browser_connect":  true,
+		"browser_install":  true,
+		"browser_launch":   true,
+		"browser_open":     true,
+		"browser_press":    true,
+		"browser_snapshot": true,
+		"browser_type":     true,
+		"capture_artifact": true,
+		"desktop_action":   true,
+		"desktop_snapshot": true,
+		"desktop_windows":  true,
+		"lsp_navigate":     true,
+		"terminal_session": true,
+		"web_fetch":        true,
+		"web_search":       true,
+	}
+	for _, tool := range BuiltinCatalog(t.TempDir()) {
+		if _, listed := wantDeferred[tool.Name()]; listed {
+			if !IsDeferred(tool) {
+				t.Errorf("%s should be deferred", tool.Name())
+			}
+			delete(wantDeferred, tool.Name())
+		} else if tool.Name() == "read_file" || tool.Name() == "read_minified_file" || tool.Name() == "grep" || tool.Name() == ExecCommandToolName || tool.Name() == "edit_file" {
+			if IsDeferred(tool) {
+				t.Errorf("essential tool %s must stay eager", tool.Name())
+			}
+		} else if IsDeferred(tool) {
+			t.Errorf("unexpected deferred builtin %s", tool.Name())
+		}
+	}
+	for missing := range wantDeferred {
+		t.Errorf("deferred builtin %s missing from catalog", missing)
 	}
 }

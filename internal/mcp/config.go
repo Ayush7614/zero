@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/config"
+	"github.com/Twigpine/zero/internal/config"
 )
 
 type ServerType string
@@ -35,7 +35,7 @@ type Server struct {
 	// credential lookup uses it to avoid reusing legacy user tokens by name.
 	ProjectConfigured bool
 	// UnconfiguredDefault is true when this server is one of Zero's built-in
-	// defaults (e.g. keyless Firecrawl) that the user never touched in their
+	// defaults (e.g. keyless Exa) that the user never touched in their
 	// config — no credentials, no overrides. Callers use it to avoid warning
 	// loudly when a server nobody configured fails to connect.
 	UnconfiguredDefault bool

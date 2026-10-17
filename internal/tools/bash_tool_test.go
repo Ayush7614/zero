@@ -13,7 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/execution"
+	"github.com/Twigpine/zero/internal/sandbox"
 )
 
 func TestMain(m *testing.M) {
@@ -83,7 +84,7 @@ func runBashToolHelper(command string) {
 }
 
 func TestCoreToolsExposeShellTools(t *testing.T) {
-	toolset := CoreTools(t.TempDir())
+	toolset := CoreToolsScoped(t.TempDir(), nil)
 	byName := make(map[string]Tool, len(toolset))
 	for _, tool := range toolset {
 		byName[tool.Name()] = tool
@@ -101,14 +102,14 @@ func TestCoreToolsExposeShellTools(t *testing.T) {
 		if tool.Safety().Permission != wantPermission {
 			t.Fatalf("%s permission = %s, want %s", name, tool.Safety().Permission, wantPermission)
 		}
-		if name == "write_stdin" && !tool.Safety().AdvertiseInAuto {
-			t.Fatalf("write_stdin should stay visible in auto mode for polling and interrupts")
+		if (name == "exec_command" || name == "write_stdin") && !tool.Safety().AdvertiseInAuto {
+			t.Fatalf("%s should stay visible in auto mode so process creation and interaction are both available", name)
 		}
 	}
 }
 
 func TestBashToolDescribesHostShellSyntax(t *testing.T) {
-	tool := NewBashTool(t.TempDir())
+	tool := NewScopedBashTool(t.TempDir(), nil)
 	schema := tool.Parameters()
 	descriptionParts := []string{tool.Description()}
 	for _, property := range schema.Properties {
@@ -123,11 +124,15 @@ func TestBashToolDescribesHostShellSyntax(t *testing.T) {
 	}
 
 	if runtime.GOOS == "windows" {
-		if !strings.Contains(description, "cmd.exe") || !strings.Contains(description, "cwd") {
-			t.Fatalf("expected Windows cmd.exe and cwd guidance in bash description, got %q", description)
-		}
-		if !strings.Contains(description, "double quotes") || !strings.Contains(description, `--jq ".a | b"`) {
-			t.Fatalf("expected the double-quote metacharacter rule in bash description, got %q", description)
+		shell := detectShellRuntime(runtime.GOOS)
+		if shell.Kind == shellKindPowerShell {
+			for _, want := range []string{"powershell", "cwd", "get-childitem", "select-string", "$env:name"} {
+				if !strings.Contains(description, want) {
+					t.Fatalf("expected Windows PowerShell guidance %q in bash description, got %q", want, description)
+				}
+			}
+		} else if !strings.Contains(description, "cmd.exe") || !strings.Contains(description, "cwd") {
+			t.Fatalf("expected Windows cmd.exe fallback guidance in bash description, got %q", description)
 		}
 		return
 	}
@@ -315,7 +320,7 @@ func TestDetectShellOutputIssueAddsWindowsSyntaxHint(t *testing.T) {
 
 func TestRegistryBlocksBashWithoutGrant(t *testing.T) {
 	registry := NewRegistry()
-	registry.Register(NewBashTool(t.TempDir()))
+	registry.Register(NewScopedBashTool(t.TempDir(), nil))
 
 	result := registry.Run(context.Background(), "bash", map[string]any{
 		"command": helperCommand("success"),
@@ -332,7 +337,7 @@ func TestRegistryBlocksBashWithoutGrant(t *testing.T) {
 func TestBashToolRunsCommandInWorkspace(t *testing.T) {
 	root := t.TempDir()
 
-	result := NewBashTool(root).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(root, nil).Run(context.Background(), map[string]any{
 		"command": helperCommand("success"),
 	})
 
@@ -350,6 +355,25 @@ func TestBashToolRunsCommandInWorkspace(t *testing.T) {
 	}
 }
 
+func TestBashToolReportsWorkspaceChangesAfterFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell syntax")
+	}
+	root := t.TempDir()
+	result := NewBashTool(root).Run(context.Background(), map[string]any{
+		"command": "printf partial > partial.txt; exit 9",
+	})
+	if result.Status != StatusError {
+		t.Fatalf("expected application failure, got %s: %s", result.Status, result.Output)
+	}
+	if len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "partial.txt" {
+		t.Fatalf("ChangedFiles = %#v, want partial.txt", result.ChangedFiles)
+	}
+	if result.ExecutionOutcome == nil || len(result.ExecutionOutcome.Changes) != 1 || result.ExecutionOutcome.Changes[0].Kind != execution.ChangeCreated {
+		t.Fatalf("typed changes = %#v, want created partial file", result.ExecutionOutcome)
+	}
+}
+
 // A command with runaway output must not be buffered whole in memory: the capture
 // is bounded to head+tail, yet raw_bytes still reports the true (much larger) size.
 // If capture were unbounded this would balloon Zero's memory before truncation.
@@ -359,7 +383,7 @@ func TestBashToolBoundsRunawayOutputCapture(t *testing.T) {
 	}
 	const produced = 500000 // ~5× the 96 KiB budget
 
-	result := NewBashTool(t.TempDir()).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(t.TempDir(), nil).Run(context.Background(), map[string]any{
 		"command": fmt.Sprintf("yes ABCDEFGH | head -c %d", produced),
 	})
 
@@ -394,7 +418,7 @@ func TestBashToolUsesRequestedCwd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := NewBashTool(root).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(root, nil).Run(context.Background(), map[string]any{
 		"command": helperCommand("pwd"),
 		"cwd":     "nested",
 	})
@@ -414,7 +438,7 @@ func TestBashToolUsesRequestedCwd(t *testing.T) {
 func TestBashToolRejectsCwdOutsideWorkspace(t *testing.T) {
 	outside := t.TempDir()
 
-	result := NewBashTool(t.TempDir()).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(t.TempDir(), nil).Run(context.Background(), map[string]any{
 		"command": helperCommand("success"),
 		"cwd":     outside,
 	})
@@ -428,25 +452,29 @@ func TestBashToolRejectsCwdOutsideWorkspace(t *testing.T) {
 }
 
 func TestBashToolReturnsNonzeroExitAsError(t *testing.T) {
-	result := NewBashTool(t.TempDir()).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(t.TempDir(), nil).Run(context.Background(), map[string]any{
 		"command": helperCommand("fail"),
 	})
 
 	if result.Status != StatusError {
 		t.Fatalf("expected error status, got %s", result.Status)
 	}
-	for _, want := range []string{"stdout:\nbefore failure", "stderr:\nfailure details", "exit_code: 7"} {
+	wantExitCode := strconv.Itoa(helperFailureExitCode())
+	for _, want := range []string{"stdout:\nbefore failure", "stderr:\nfailure details", "exit_code: " + wantExitCode} {
 		if !strings.Contains(result.Output, want) {
 			t.Fatalf("expected output to contain %q, got %q", want, result.Output)
 		}
 	}
-	if result.Meta["exit_code"] != "7" {
-		t.Fatalf("expected exit_code metadata 7, got %q", result.Meta["exit_code"])
+	if result.Meta["exit_code"] != wantExitCode {
+		t.Fatalf("expected exit_code metadata %s, got %q", wantExitCode, result.Meta["exit_code"])
+	}
+	if result.ExecutionOutcome == nil || result.ExecutionOutcome.State != execution.StateFailed || result.ExecutionOutcome.Kind != execution.OutcomeApplicationFailure {
+		t.Fatalf("execution outcome = %#v, want failed/application_failure", result.ExecutionOutcome)
 	}
 }
 
 func TestBashToolTimesOut(t *testing.T) {
-	result := NewBashTool(t.TempDir()).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(t.TempDir(), nil).Run(context.Background(), map[string]any{
 		"command":    helperCommand("sleep"),
 		"timeout_ms": 20,
 	})
@@ -459,6 +487,9 @@ func TestBashToolTimesOut(t *testing.T) {
 	}
 	if result.Meta["timeout_ms"] != "20" {
 		t.Fatalf("expected timeout_ms metadata 20, got %q", result.Meta["timeout_ms"])
+	}
+	if result.ExecutionOutcome == nil || result.ExecutionOutcome.Kind != execution.OutcomeTimedOut {
+		t.Fatalf("execution outcome = %#v, want timed_out", result.ExecutionOutcome)
 	}
 }
 
@@ -482,7 +513,7 @@ func TestBashToolTimeoutKillsBackgroundChildren(t *testing.T) {
 	command := fmt.Sprintf("(sleep 1; touch %s) & wait", shellQuote(sentinel))
 
 	start := time.Now()
-	result := NewBashTool(root).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(root, nil).Run(context.Background(), map[string]any{
 		"command":    command,
 		"timeout_ms": 300,
 	})
@@ -507,7 +538,7 @@ func TestBashToolTimeoutKillsBackgroundChildren(t *testing.T) {
 func TestRegistryRunsWithDegradedUnavailableNativeSandbox(t *testing.T) {
 	root := t.TempDir()
 	registry := NewRegistry()
-	registry.Register(NewBashTool(root))
+	registry.Register(NewScopedBashTool(root, nil))
 	engine := sandbox.NewEngine(sandbox.EngineOptions{
 		WorkspaceRoot: root,
 		Policy:        sandbox.DefaultPolicy(),
@@ -551,11 +582,17 @@ func TestBashToolRequireEscalatedMsysGuard(t *testing.T) {
 		})
 	}
 	registry := NewRegistry()
-	registry.Register(NewBashTool(root))
+	registry.Register(NewScopedBashTool(root, nil))
+	msysCommand := "cat somefile.txt"
+	if detectShellRuntime(runtime.GOOS).Kind == shellKindPowerShell {
+		// cat is a native Get-Content alias in PowerShell. Use a name that
+		// still resolves to an incompatible Git-for-Windows MSYS executable.
+		msysCommand = "grep pattern somefile.txt"
+	}
 
 	t.Run("default sandboxing still blocks an MSYS-prone command", func(t *testing.T) {
 		result := registry.RunWithOptions(context.Background(), "bash", map[string]any{
-			"command": "cat somefile.txt",
+			"command": msysCommand,
 		}, RunOptions{
 			PermissionGranted: true,
 			Sandbox:           newEngine(),
@@ -568,7 +605,7 @@ func TestBashToolRequireEscalatedMsysGuard(t *testing.T) {
 
 	t.Run("approved require_escalated bypasses the MSYS guard", func(t *testing.T) {
 		result := registry.RunWithOptions(context.Background(), "bash", map[string]any{
-			"command":             "cat somefile.txt",
+			"command":             msysCommand,
 			"sandbox_permissions": string(SandboxPermissionsRequireEscalated),
 		}, RunOptions{
 			PermissionGranted: true,
@@ -588,7 +625,14 @@ func TestBashToolRequireEscalatedMsysGuard(t *testing.T) {
 
 	t.Run("approved require_escalated still blocks an unrelated syntax issue", func(t *testing.T) {
 		result := registry.RunWithOptions(context.Background(), "bash", map[string]any{
-			"command":             `cd /d/tmp/zero-pr-158 && dir`,
+			// No `&&` here on purpose. The POSIX-style path is what this case is
+			// about, and on Windows PowerShell 5.1 a chained command trips the
+			// separate windows_powershell_version preflight first, which shadows
+			// the block being asserted. That only shows up on 5.1: the runners
+			// have PowerShell 7, where && is valid and the version check does not
+			// fire, so the substitution kept this green in CI while failing on the
+			// shell a stock Windows box actually gets.
+			"command":             `cd /d/tmp/zero-pr-158`,
 			"sandbox_permissions": string(SandboxPermissionsRequireEscalated),
 		}, RunOptions{
 			PermissionGranted: true,
@@ -618,12 +662,13 @@ func TestBashToolIgnoresMsysMarkersInCommandArgumentsAfterFailure(t *testing.T) 
 	// otherwise unused by the helper but still part of the command line text.
 	command := helperCommand("fail") + ` "fatal error - CreateFileMapping S-1-5-21, Win32 error 5. Terminating. cygheap_user::init"`
 
-	result := NewBashTool(root).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(root, nil).Run(context.Background(), map[string]any{
 		"command": command,
 	})
 
-	if result.Status != StatusError || result.Meta["exit_code"] != "7" {
-		t.Fatalf("expected the helper's real exit 7 failure, got %s: %#v", result.Status, result)
+	wantExitCode := strconv.Itoa(helperFailureExitCode())
+	if result.Status != StatusError || result.Meta["exit_code"] != wantExitCode {
+		t.Fatalf("expected the helper failure exit %s, got %s: %#v", wantExitCode, result.Status, result)
 	}
 	if result.Meta["shell_issue"] == "windows_msys_sandbox" {
 		t.Fatalf("expected the MSYS marker in the command's own argument text to be ignored, got %#v", result)
@@ -639,7 +684,7 @@ func TestBashToolRunsWithDegradedUnavailableNativeSandbox(t *testing.T) {
 		Backend:       sandbox.Backend{Name: sandbox.BackendUnavailable, Message: "native sandbox unavailable"},
 	})
 
-	result := NewBashTool(root).(interface {
+	result := NewScopedBashTool(root, nil).(interface {
 		RunWithSandbox(context.Context, map[string]any, *sandbox.Engine) Result
 	}).RunWithSandbox(context.Background(), map[string]any{
 		"command": helperCommand("success"),
@@ -699,7 +744,7 @@ func TestBashToolRunsWithHostSandboxBackendWhenAvailable(t *testing.T) {
 		Backend:       backend,
 	})
 
-	result := NewBashTool(root).(interface {
+	result := NewScopedBashTool(root, nil).(interface {
 		RunWithSandbox(context.Context, map[string]any, *sandbox.Engine) Result
 	}).RunWithSandbox(context.Background(), map[string]any{
 		"command": "printf sandbox-ok",
@@ -719,7 +764,7 @@ func TestBashToolRunsWithHostSandboxBackendWhenAvailable(t *testing.T) {
 func TestBashToolBlocksInteractiveCommandBeforeExecution(t *testing.T) {
 	root := t.TempDir()
 
-	result := NewBashTool(root).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(root, nil).Run(context.Background(), map[string]any{
 		"command": "vim main.go",
 	})
 
@@ -752,7 +797,7 @@ func TestBashToolBlocksInteractiveCommandThroughSandbox(t *testing.T) {
 		Backend:       sandbox.Backend{Name: sandbox.BackendUnavailable, Message: "native sandbox unavailable"},
 	})
 
-	result := NewBashTool(root).(interface {
+	result := NewScopedBashTool(root, nil).(interface {
 		RunWithSandbox(context.Context, map[string]any, *sandbox.Engine) Result
 	}).RunWithSandbox(context.Background(), map[string]any{
 		"command": "less /etc/hosts",
@@ -776,7 +821,7 @@ func TestBashToolBlocksInteractiveCommandThroughSandbox(t *testing.T) {
 func TestBashToolAllowsNonInteractiveCommand(t *testing.T) {
 	root := t.TempDir()
 
-	result := NewBashTool(root).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(root, nil).Run(context.Background(), map[string]any{
 		"command": helperCommand("success"),
 	})
 
@@ -809,7 +854,7 @@ func TestBashToolPreservesEmbeddedQuotesOnWindows(t *testing.T) {
 	// showed exactly where the corruption happened.
 	commandText := executable + ` --zero-bash-helper echo-arg "hello / world"`
 
-	result := NewBashTool(root).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(root, nil).Run(context.Background(), map[string]any{
 		"command": commandText,
 	})
 
@@ -834,9 +879,12 @@ func TestBashToolRunsCommandLineForLoopSyntax(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("cmd.exe command-line vs batch-file parsing is Windows-specific")
 	}
+	if detectShellRuntime(runtime.GOOS).Kind != shellKindCmd {
+		t.Skip("cmd.exe fallback is not selected")
+	}
 	root := t.TempDir()
 
-	result := NewBashTool(root).Run(context.Background(), map[string]any{
+	result := NewScopedBashTool(root, nil).Run(context.Background(), map[string]any{
 		"command": "for %i in (1 2 3) do echo %i",
 	})
 
@@ -853,6 +901,10 @@ func TestBashToolRunsCommandLineForLoopSyntax(t *testing.T) {
 func helperCommand(name string) string {
 	executable := shellQuote(os.Args[0])
 	return executable + " --zero-bash-helper " + name
+}
+
+func helperFailureExitCode() int {
+	return 7
 }
 
 func shellQuote(value string) string {

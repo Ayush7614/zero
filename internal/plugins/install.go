@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Twigpine/zero/internal/installtxn"
 )
 
 // manifestFileName is the plugin manifest filename, matching the loader.
@@ -128,6 +130,38 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 		return InstallResult{}, fmt.Errorf("hash plugin: %w", err)
 	}
 
+	staged, cleanupStage, err := installtxn.StageDir(dir)
+	if err != nil {
+		return InstallResult{}, err
+	}
+	defer cleanupStage()
+	// Copy the whole plugin tree (entry scripts, prompts, skills) into a sibling
+	// staging area. Copy DATA only — never execute it.
+	if err := copyTree(pluginDir, staged); err != nil {
+		return InstallResult{}, fmt.Errorf("stage plugin: %w", err)
+	}
+	stagedHash, err := hashTree(staged)
+	if err != nil {
+		return InstallResult{}, fmt.Errorf("validate staged plugin: %w", err)
+	}
+	if stagedHash != hash {
+		return InstallResult{}, errors.New("validate staged plugin: copied content hash differs from source")
+	}
+
+	unlock, err := installtxn.Lock(dir)
+	if err != nil {
+		return InstallResult{}, err
+	}
+	defer unlock()
+	// Put back anything an earlier run was killed mid-commit, and abort if a
+	// transaction could not be resolved: installing over a tree that is still
+	// owed a restore destroys the only copy of it. See installtxn.Recover.
+	if err := installtxn.Recover(dir, reconcileInterrupted(dir)); err != nil {
+		return InstallResult{}, err
+	}
+
+	// Re-read under the cross-process lock. Another install may have updated the
+	// lockfile while this plugin was fetched and staged.
 	lock, err := ReadLock(dir)
 	if err != nil {
 		return InstallResult{}, err
@@ -138,20 +172,10 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	}
 
 	target := filepath.Join(dir, id)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return InstallResult{}, fmt.Errorf("create plugins dir: %w", err)
-	}
-	if err := os.RemoveAll(target); err != nil {
-		return InstallResult{}, fmt.Errorf("clear previous plugin: %w", err)
-	}
-	// Copy the whole plugin tree (entry scripts, prompts, skills) so the installed
-	// plugin is runnable through activation. Copy DATA only — never execute it.
-	if err := copyTree(pluginDir, target); err != nil {
-		return InstallResult{}, fmt.Errorf("copy plugin: %w", err)
-	}
-
 	lock[id] = LockEntry{Source: source, Hash: hash}
-	if err := writeLock(dir, lock); err != nil {
+	if err := installtxn.CommitDir(target, staged, func() error {
+		return writeLock(dir, lock)
+	}); err != nil {
 		return InstallResult{}, err
 	}
 
@@ -182,6 +206,19 @@ func Remove(dir string, id string) error {
 		return fmt.Errorf("invalid plugin id %q", id)
 	}
 
+	unlock, err := installtxn.Lock(dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	// Put back anything an earlier run was killed mid-commit, and abort if a
+	// transaction could not be resolved: reporting a removal while a backup this
+	// run never saw stays on disk lets the next install publish it again. See
+	// installtxn.Recover.
+	if err := installtxn.Recover(dir, reconcileInterrupted(dir)); err != nil {
+		return err
+	}
+
 	lock, err := ReadLock(dir)
 	if err != nil {
 		return err
@@ -194,17 +231,86 @@ func Remove(dir string, id string) error {
 		return fmt.Errorf("plugin %q is not installed", id)
 	}
 	if present {
-		if err := os.RemoveAll(target); err != nil {
+		if err := installtxn.RemoveDir(target, func() error {
+			if !locked {
+				return nil
+			}
+			delete(lock, id)
+			return writeLock(dir, lock)
+		}); err != nil {
 			return fmt.Errorf("remove plugin dir: %w", err)
 		}
-	}
-	if locked {
+	} else if locked {
 		delete(lock, id)
 		if err := writeLock(dir, lock); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// reconcileInterrupted answers the one question installtxn.Recover cannot read
+// off the filesystem: of the two trees an interrupted commit left, which one is
+// the one the lockfile records. CommitDir swaps the trees and only then
+// publishes, so a kill between the two leaves exactly what a kill after both
+// leaves, and only the published metadata tells them apart. The recorded hash is
+// the same hashTree the install computed over the tree it copied, so matching it
+// against each tree is an exact answer rather than a guess at filesystem shape.
+func reconcileInterrupted(dir string) installtxn.Reconciler {
+	return func(id string, target string, backup string) (installtxn.Phase, error) {
+		lock, err := ReadLock(dir)
+		if err != nil {
+			// An unreadable lockfile is not an empty one. Reporting a phase from it
+			// would be reading a fact out of a file we could not read.
+			return installtxn.PhaseUnknown, err
+		}
+		entry, ok := lock[id]
+		if !ok {
+			// A missing entry is not proof that the publish never ran. The entry can
+			// also be lost after a publish that did run: a truncated or deleted
+			// lockfile reads as an empty one, and a directory with no entry is a
+			// state this package supports (Load returns it, Remove handles it). The
+			// live tree here may be nothing to do with this transaction at all, so
+			// there is no phase to report and recovery must not pick between them.
+			return installtxn.PhaseUnknown, nil
+		}
+		if entry.Hash == "" {
+			// A hand edited entry records no tree at all, so there is nothing to
+			// match either side against and no phase to report.
+			return installtxn.PhaseUnknown, nil
+		}
+		matched, err := treeMatchesHash(target, entry.Hash)
+		if err != nil {
+			return installtxn.PhaseUnknown, err
+		}
+		if matched {
+			return installtxn.PhaseCommitted, nil
+		}
+		matched, err = treeMatchesHash(backup, entry.Hash)
+		if err != nil {
+			return installtxn.PhaseUnknown, err
+		}
+		if matched {
+			return installtxn.PhasePrePublish, nil
+		}
+		return installtxn.PhaseUnknown, nil
+	}
+}
+
+// treeMatchesHash reports whether the tree at path hashes to want. A path that
+// is not there is a non-match rather than an error: recovery asks about two
+// trees it has just seen on disk, so one going missing under it only means that
+// tree is not the one the lockfile records. Every other hashing failure is
+// returned, because a tree we could not read may well be the recorded one.
+func treeMatchesHash(path string, want string) (bool, error) {
+	hash, err := hashTree(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return hash == want, nil
 }
 
 // ReadLock loads the plugins lockfile from dir. A missing lockfile yields an
@@ -239,7 +345,7 @@ func writeLock(dir string, entries map[string]LockEntry) error {
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", LockFileName, err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, LockFileName), append(data, '\n'), 0o644); err != nil {
+	if err := installtxn.WriteFileAtomically(filepath.Join(dir, LockFileName), append(data, '\n'), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", LockFileName, err)
 	}
 	return nil

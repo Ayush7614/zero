@@ -181,6 +181,32 @@ func TestStoreForkCopiesEventsAndLineage(t *testing.T) {
 	}
 }
 
+func TestStoreForkSupportsNonResumableSideSession(t *testing.T) {
+	store := NewStore(StoreOptions{RootDir: t.TempDir()})
+	parent, err := store.Create(CreateInput{SessionID: "parent", Title: "Parent"})
+	if err != nil {
+		t.Fatalf("Create parent: %v", err)
+	}
+	if _, err := store.AppendEvent(parent.SessionID, AppendEventInput{Type: EventMessage, Payload: map[string]string{"content": "context"}}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	side, err := store.Fork(parent.SessionID, ForkInput{
+		SessionID:   "side",
+		SessionKind: SessionKindSide,
+		Tag:         "btw",
+	})
+	if err != nil {
+		t.Fatalf("Fork side: %v", err)
+	}
+	if side.SessionKind != SessionKindSide || side.Tag != "btw" || side.ParentSessionID != parent.SessionID {
+		t.Fatalf("side metadata = %#v", side)
+	}
+	if IsResumableKind(side.SessionKind) {
+		t.Fatal("side sessions must not appear as resumable conversations")
+	}
+}
+
 func TestStoreForkSkipsUsageEvents(t *testing.T) {
 	store := NewStore(StoreOptions{RootDir: t.TempDir(), Now: fixedClock("2026-06-04T11:00:00Z")})
 	parent, err := store.Create(CreateInput{SessionID: "parent", Title: "Parent"})
@@ -381,6 +407,7 @@ func TestListAndLatestResumableExcludeSubRuns(t *testing.T) {
 	mk(SessionKindSpecImpl, "spec-impl-1")
 	newestResumable := mk("", "conversation-2") // newest standalone conversation
 	mk(SessionKindChild, "child-2")             // newer overall, but a sub-run
+	mk(SessionKindSide, "side-1")               // newer overall, but non-resumable
 
 	resumable, err := store.ListResumable()
 	if err != nil {
@@ -404,7 +431,7 @@ func TestListAndLatestResumableExcludeSubRuns(t *testing.T) {
 		if latest != nil {
 			got = latest.SessionID
 		}
-		t.Fatalf("LatestResumable = %s, want newest resumable %s (must skip the newer child)", got, newestResumable.SessionID)
+		t.Fatalf("LatestResumable = %s, want newest resumable %s (must skip newer child and side sessions)", got, newestResumable.SessionID)
 	}
 }
 
@@ -535,6 +562,9 @@ func TestPrepareExecSessionResolvesResumeAndFork(t *testing.T) {
 	if _, err := store.AppendEvent("latest", AppendEventInput{Type: EventMessage, Payload: map[string]any{"content": "previous answer"}}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.Create(CreateInput{SessionID: "newer-side", SessionKind: SessionKindSide}); err != nil {
+		t.Fatal(err)
+	}
 
 	prepared, err := PrepareExec(PrepareExecOptions{Store: store, ResumeLatest: true})
 	if err != nil {
@@ -545,6 +575,9 @@ func TestPrepareExecSessionResolvesResumeAndFork(t *testing.T) {
 	}
 	if got := FormatExecPrompt("continue", prepared); got == "continue" || !strings.Contains(got, "previous answer") {
 		t.Fatalf("expected session context in prompt, got %q", got)
+	}
+	if _, err := PrepareExec(PrepareExecOptions{Store: store, Resume: "newer-side"}); err == nil || !strings.Contains(err.Error(), "Zero session is not resumable: newer-side") {
+		t.Fatalf("explicit side-session resume error = %v, want non-resumable rejection", err)
 	}
 
 	forked, err := PrepareExec(PrepareExecOptions{Store: store, Fork: "latest", SessionID: "forked"})
@@ -577,8 +610,60 @@ func TestFormatExecPromptKeepsConversationMessagesWhenNoisyEventsFollow(t *testi
 			t.Fatalf("expected prompt to contain %q, got %q", want, prompt)
 		}
 	}
+	// The tool results here follow the last assistant answer, so they are work
+	// nothing has spoken for yet. They are carried on purpose: that is the whole
+	// of what an interrupted turn leaves behind (#913). The property this test
+	// was written for (#460) is that CONVERSATION survives a noisy turn, and the
+	// assertions above still hold it.
+	// The tool results here follow the last assistant answer, so they are work
+	// nothing has spoken for yet, and an interrupted turn leaves exactly this
+	// behind (#913). Their IDENTITY is carried; their OUTPUT is not, because the
+	// call beside them already names what was touched and the body is the part
+	// that can carry file contents into a later prompt.
+	if !strings.Contains(prompt, "tool_result: read_file") {
+		t.Fatalf("expected unanswered tool work to be named, got %q", prompt)
+	}
 	if strings.Contains(prompt, "noisy tool result") {
-		t.Fatalf("expected prompt to omit noisy non-conversation events, got %q", prompt)
+		t.Fatalf("tool output body reached the prompt, got %q", prompt)
+	}
+	if count := strings.Count(prompt, "tool_result:"); count > 24 {
+		t.Fatalf("carried %d tool events, over the tail allowance of 24: %q", count, prompt)
+	}
+}
+
+// AND WORK THE ASSISTANT ALREADY SPOKE FOR STAYS FILTERED.
+//
+// The counterpart to the case above, and what keeps that one from being
+// satisfied by carrying every tool event ever recorded. Once an answer describes
+// the work, repeating the raw results adds length and no information.
+func TestFormatExecPromptOmitsToolWorkAnAnswerAlreadyCovers(t *testing.T) {
+	events := []Event{
+		{Sequence: 1, Type: EventMessage, Payload: json.RawMessage(`{"role":"user","content":"first user request"}`)},
+	}
+	for sequence := 2; sequence <= 20; sequence++ {
+		events = append(events, Event{Sequence: sequence, Type: EventToolResult, Payload: json.RawMessage(`{"name":"read_file","output":"already summarized tool result"}`)})
+	}
+	events = append(events,
+		Event{Sequence: 21, Type: EventMessage, Payload: json.RawMessage(`{"role":"assistant","content":"I read the files and here is the summary"}`)},
+		Event{Sequence: 22, Type: EventMessage, Payload: json.RawMessage(`{"role":"user","content":"latest user request"}`)},
+	)
+
+	prompt := FormatExecPrompt("continue", PreparedExec{
+		Mode:          ModeResume,
+		Session:       Metadata{SessionID: "session-already-answered"},
+		ContextEvents: events,
+	})
+
+	if strings.Contains(prompt, "already summarized tool result") {
+		t.Fatalf("tool work the assistant already described was repeated verbatim, got %q", prompt)
+	}
+	if strings.Contains(prompt, "tool_result:") {
+		t.Fatalf("an answered turn still listed its tool events, got %q", prompt)
+	}
+	for _, want := range []string{"first user request", "here is the summary", "latest user request"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected prompt to contain %q, got %q", want, prompt)
+		}
 	}
 }
 

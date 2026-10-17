@@ -2,11 +2,10 @@ package tui
 
 import (
 	"context"
-	"strings"
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/Gitlawb/zero/internal/dictation"
+	"github.com/Twigpine/zero/internal/dictation"
 )
 
 // sttPartialMsg carries an incremental streaming transcript into the TUI. It is
@@ -14,8 +13,9 @@ import (
 // mechanism agent text deltas use (§6). text is the cumulative best transcript
 // so far (not a delta); final marks a settled segment.
 type sttPartialMsg struct {
-	text  string
-	final bool
+	sessionID int64
+	text      string
+	final     bool
 }
 
 // startStreamingDictation begins continuous capture and launches the streaming
@@ -38,6 +38,7 @@ func (m model) startStreamingDictation() (model, tea.Cmd) {
 	}
 	transcriber := m.dictation.transcriber
 	submit := m.dictation.cfg.AutoSubmitEnabled()
+	sessionID := m.dictation.sessionID
 
 	// Tap the audio: compute a mic level per chunk for the live waveform, then
 	// forward the chunk to the transcriber. A small buffer keeps the tap from
@@ -63,11 +64,11 @@ func (m model) startStreamingDictation() (model, tea.Cmd) {
 	streamCmd := func() tea.Msg {
 		onPartial := func(text string, final bool) {
 			if sink != nil {
-				sink(sttPartialMsg{text: text, final: final})
+				sink(sttPartialMsg{sessionID: sessionID, text: text, final: final})
 			}
 		}
 		text, err := transcriber.StreamTranscribe(ctx, tapped, onPartial)
-		return dictationTranscribedMsg{text: text, err: err, submit: submit, streaming: true}
+		return dictationTranscribedMsg{sessionID: sessionID, text: text, err: err, submit: submit, streaming: true}
 	}
 	// Streaming drives the waveform from real levels (no synthetic tick needed).
 	return m, streamCmd
@@ -77,6 +78,9 @@ func (m model) startStreamingDictation() (model, tea.Cmd) {
 // composer, replacing the previously-rendered live region wholesale so the text
 // builds up in place as the user keeps talking.
 func (m model) handleDictationPartial(msg sttPartialMsg) model {
+	if msg.sessionID != m.dictation.sessionID {
+		return m
+	}
 	// Ignore stragglers that arrive after the session ended (cancel/final).
 	if m.dictation.phase != dictRecording && m.dictation.phase != dictTranscribing {
 		return m
@@ -87,52 +91,30 @@ func (m model) handleDictationPartial(msg sttPartialMsg) model {
 
 func (m *model) applyStreamingText(text string) {
 	state := m.currentComposerState()
+	stateRunes := []rune(state.text)
 	if !m.dictation.regionActive {
 		m.dictation.regionActive = true
 		m.dictation.regionStart = state.cursor
 		m.dictation.regionEnd = state.cursor
 		m.dictation.regionPrefix = ""
-		// Anchor the prefix text BEFORE the live region. If the user types or
-		// pastes outside the region, the next partial can detect the change in
-		// this prefix and shift [start,end) to stay aligned.
-		m.dictation.regionAnchor = state.text
+		// Anchor the prefix text before the live region. A later partial removes
+		// the tracked range only while both this prefix and the rendered region
+		// still match.
+		m.dictation.regionAnchor = string(stateRunes[:state.cursor])
 		if needsLeadingSpace(state) {
 			// Fold the separator into the region so a cancel removes it too.
 			m.dictation.regionPrefix = " "
 		}
-	} else {
-		// Compare the prefix before the live region. If it changed (the user
-		// typed/pasted there) shift [start,end) by the length delta so the
-		// next partial's slice targets the right span. If the user edited
-		// INSIDE the region, drop the live region and re-anchor at the
-		// current cursor — we can't tell the partial from the user's text
-		// after that point.
-		prefix := string([]rune(state.text)[:m.dictation.regionStart])
-		anchor := m.dictation.regionAnchor
-		switch {
-		case prefix == anchor:
-			// External edit at or after the region — no shift needed.
-		case len(prefix) > len(anchor) && strings.HasPrefix(prefix, anchor):
-			// External edit inserted text just before the region (i.e. at
-			// position regionStart, pushing the region right).
-			delta := len([]rune(prefix)) - len([]rune(anchor))
-			m.dictation.regionStart += delta
-			m.dictation.regionEnd += delta
-			m.dictation.regionAnchor = prefix
-		case len(anchor) > len(prefix) && strings.HasPrefix(anchor, prefix):
-			// External delete just before the region.
-			delta := len([]rune(anchor)) - len([]rune(prefix))
-			m.dictation.regionStart -= delta
-			m.dictation.regionEnd -= delta
-			m.dictation.regionAnchor = prefix
-		default:
-			// User edited inside or across the region — can't safely
-			// overwrite. Drop the live region and re-anchor at the cursor
-			// so the next partial inserts as a fresh span.
-			m.dictation.regionStart = state.cursor
-			m.dictation.regionEnd = state.cursor
-			m.dictation.regionPrefix = ""
-			m.dictation.regionAnchor = string([]rune(state.text)[:state.cursor])
+	} else if !m.dictation.liveRegionMatches(stateRunes) {
+		// The composer changed before or inside the tracked range. Its old
+		// bounds no longer prove which bytes belong to dictation, so preserve
+		// everything and insert the next partial as a fresh live region.
+		m.dictation.regionStart = state.cursor
+		m.dictation.regionEnd = state.cursor
+		m.dictation.regionPrefix = ""
+		m.dictation.regionAnchor = string(stateRunes[:state.cursor])
+		if needsLeadingSpace(state) {
+			m.dictation.regionPrefix = " "
 		}
 	}
 	// Replace [regionStart, regionEnd) with prefix + the new cumulative text.
@@ -148,7 +130,14 @@ func (m *model) applyStreamingText(text string) {
 	}
 	updated := insertComposerText(cleared, rendered)
 	m.dictation.regionEnd = m.dictation.regionStart + len([]rune(rendered))
+	m.dictation.regionRendered = rendered
 	m.setComposerState(updated)
+}
+
+func (d dictationController) liveRegionMatches(stateRunes []rune) bool {
+	return d.regionStart >= 0 && d.regionEnd >= d.regionStart && d.regionEnd <= len(stateRunes) &&
+		string(stateRunes[:d.regionStart]) == d.regionAnchor &&
+		string(stateRunes[d.regionStart:d.regionEnd]) == d.regionRendered
 }
 
 // commitDictationRegion keeps the streamed text in the composer and stops
@@ -156,6 +145,7 @@ func (m *model) applyStreamingText(text string) {
 // transcript equals the last partial already rendered).
 func (m model) commitDictationRegion() model {
 	m.dictation.regionActive = false
+	m.dictation.regionRendered = ""
 	return m
 }
 
@@ -164,8 +154,11 @@ func (m model) commitDictationRegion() model {
 func (m model) discardDictationRegion() model {
 	if m.dictation.regionActive {
 		state := m.currentComposerState()
-		m.setComposerState(deleteComposerRange(state, m.dictation.regionStart, m.dictation.regionEnd))
+		if m.dictation.liveRegionMatches([]rune(state.text)) {
+			m.setComposerState(deleteComposerRange(state, m.dictation.regionStart, m.dictation.regionEnd))
+		}
 		m.dictation.regionActive = false
+		m.dictation.regionRendered = ""
 	}
 	return m
 }

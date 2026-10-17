@@ -1,16 +1,26 @@
 package tui
 
 import (
+	"bytes"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/imageinput"
-	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/imageinput"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/providermodeldiscovery"
+	"github.com/Twigpine/zero/internal/terminalpet"
+	"github.com/Twigpine/zero/internal/zeroruntime"
+	_ "golang.org/x/image/webp"
 )
+
+const attachmentThumbnailMaxPixels = 16 << 20
 
 // droppableImageExts are the image extensions a dragged-and-dropped file may
 // carry (matched case-insensitively); PDFs are recognized separately.
@@ -93,33 +103,44 @@ func stripMatchingQuotes(s string) (string, bool) {
 //     fetched it) — this carries InputModalities from models.dev, which
 //     includes "image" for vision-capable models
 //  3. Falls back to the name heuristic for unknown models
-func (m model) modelSupportsVisionTUI() bool {
-	trimmed := strings.TrimSpace(m.modelName)
+func (m model) modelSupportsVisionFor(modelID string) bool {
+	trimmed := strings.TrimSpace(modelID)
 	if trimmed == "" {
 		return false
 	}
-	// The curated catalog is authoritative only when it knows the model.
+	// Check the discovered model list for the ACTIVE provider route first.
+	if models, ok := m.discoveredModelsForActiveRoute(); ok {
+		if supported, ok := discoveredVisionSupport(models, trimmed); ok {
+			return supported
+		}
+	}
+	// The curated catalog is authoritative when active-provider discovery is absent or inconclusive.
 	if entry, known := m.modelCatalog.Resolve(trimmed); known {
 		return entry.Supports(modelregistry.ModelCapabilityVision)
 	}
-	// Check the discovered model list (from models.dev) for InputModalities
-	// containing "image". This covers custom/ollama/cloud models not in the
-	// curated catalog — models.dev knows their capabilities.
-	for _, models := range m.modelPickerLiveByProvider {
-		for _, dm := range models {
-			if strings.EqualFold(strings.TrimSpace(dm.ID), trimmed) {
-				for _, modality := range dm.InputModalities {
-					if strings.EqualFold(strings.TrimSpace(modality), "image") {
-						return true
-					}
-				}
-				return false // found the model in discovered list, no image modality
+	// Fall back to curated catalog or the name heuristic.
+	return modelregistry.SupportsVision(m.modelCatalog, trimmed)
+}
+
+func discoveredVisionSupport(models []providermodeldiscovery.Model, modelID string) (bool, bool) {
+	for _, dm := range models {
+		if strings.EqualFold(strings.TrimSpace(dm.ID), modelID) {
+			if len(dm.InputModalities) == 0 {
+				return false, false
 			}
+			for _, modality := range dm.InputModalities {
+				if strings.EqualFold(strings.TrimSpace(modality), "image") {
+					return true, true
+				}
+			}
+			return false, true // found model with explicit modalities, no image modality
 		}
 	}
-	// Fall back to the name heuristic for models not in the catalog or
-	// discovered list.
-	return modelregistry.VisionCapableByName(trimmed)
+	return false, false
+}
+
+func (m model) modelSupportsVisionTUI() bool {
+	return m.modelSupportsVisionFor(m.modelName)
 }
 
 // attachClipboardImage attaches an image read from the OS clipboard (a
@@ -141,6 +162,7 @@ func (m model) attachClipboardImage(data []byte, mediaType string) model {
 		Data:      data,
 	})
 	m.pendingImageLabels = append(m.pendingImageLabels, "clipboard")
+	m.refreshPendingImageThumbnail()
 	return m
 }
 
@@ -157,6 +179,7 @@ func (m model) handleImageCommand(arg string) model {
 	case strings.EqualFold(trimmed, "clear"):
 		m.pendingImages = nil
 		m.pendingImageLabels = nil
+		m.pendingImageThumbnails = nil
 		m.pendingDocuments = nil
 		return m.appendImageNotice("Cleared pending attachments.")
 	}
@@ -185,6 +208,7 @@ func (m model) handleImageCommand(arg string) model {
 
 	m.pendingImages = append(m.pendingImages, block)
 	m.pendingImageLabels = append(m.pendingImageLabels, filepath.Base(trimmed))
+	m.refreshPendingImageThumbnail()
 	// No "attached" system message: the composer attachment chip ([Image #N]) is
 	// the confirmation, matching the compact attach UX.
 	return m
@@ -219,6 +243,7 @@ func (m model) handleDocumentAttach(path string) model {
 		m.pendingImages = append(m.pendingImages, block)
 		m.pendingImageLabels = append(m.pendingImageLabels, label)
 	}
+	m.refreshPendingImageThumbnail()
 	// The composer attachment chip ([Doc #N] / [Image #N]) is the confirmation; no
 	// "attached" system message.
 	return m
@@ -269,23 +294,44 @@ func (m model) removeLastAttachment() (model, bool) {
 		if len(m.pendingImages) > 0 {
 			m.pendingImages = m.pendingImages[:len(m.pendingImages)-1]
 		}
+		m.refreshPendingImageThumbnail()
 		return m, true
 	}
 	return m, false
 }
 
-// renderImageChips builds a compact "[Image #1] [Image #2]" row for the pending
-// image attachments, or "" when there are none, so the long file name never
-// clutters the input. Kept plain so the renderer can wrap/style it consistently.
-func renderImageChips(labels []string) string {
-	if len(labels) == 0 {
-		return ""
+// refreshPendingImageThumbnail prepares only the first pending image for the
+// optional inline terminal preview. Decode failures deliberately leave the
+// attachment intact: the text chip remains the portable fallback and the model
+// still receives the original bytes.
+func (m *model) refreshPendingImageThumbnail() {
+	m.pendingImageThumbnails = nil
+	if len(m.pendingImages) == 0 {
+		return
 	}
-	chips := make([]string, 0, len(labels))
-	for i := range labels {
-		chips = append(chips, fmt.Sprintf("[Image #%d]", i+1))
+	count := min(len(m.pendingImages), attachmentPreviewMaxImages)
+	m.pendingImageThumbnails = make([]*terminalpet.Animation, count)
+	for index := 0; index < count; index++ {
+		preview, err := attachmentThumbnail(m.pendingImages[index])
+		if err == nil {
+			m.pendingImageThumbnails[index] = preview
+		}
 	}
-	return strings.Join(chips, " ")
+}
+
+func attachmentThumbnail(block zeroruntime.ImageBlock) (*terminalpet.Animation, error) {
+	config, _, err := image.DecodeConfig(bytes.NewReader(block.Data))
+	if err != nil {
+		return nil, err
+	}
+	if config.Width < 1 || config.Height < 1 || config.Width > attachmentThumbnailMaxPixels/config.Height {
+		return nil, fmt.Errorf("image is too large for an inline thumbnail")
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(block.Data))
+	if err != nil {
+		return nil, err
+	}
+	return terminalpet.ThumbnailAnimation(decoded)
 }
 
 // renderAttachmentChips builds the pending-attachment row from both staged images

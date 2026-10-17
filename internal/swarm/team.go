@@ -16,6 +16,11 @@ import (
 // on-demand worker model).
 const defaultMaxTeamSize = 8
 
+// defaultHandoffStopTimeout bounds the model-facing handoff tool while it waits
+// for a cancellation-insensitive source member. Timing out never starts the
+// successor, so the single-owner guarantee remains fail closed.
+const defaultHandoffStopTimeout = 30 * time.Second
+
 // maxMemberRestarts bounds automatic relaunches of a member that exits with a
 // temporary error, mirroring daemon.Pool's bounded backoff retries.
 const maxMemberRestarts = 2
@@ -60,14 +65,30 @@ type Swarm struct {
 	mailbox     *Mailbox
 	launcher    MemberLauncher
 	maxTeamSize int
+	// handoffStopTimeout is fixed to the default in production and kept on the
+	// instance so lifecycle tests can exercise the deadline without a global race.
+	handoffStopTimeout time.Duration
 
 	baseCtx context.Context
 	cancel  context.CancelFunc
 
+	// lifecycleMu guards closed and orders admission against shutdown. It is held
+	// only for the flag check plus the lifecycleWork increment — never across a
+	// launcher call, which would deadlock Close (see beginLifecycleAdmission).
+	lifecycleMu sync.RWMutex
+	closed      bool
+	// lifecycleWork counts admitted-but-unfinished lifecycle operations (spawn,
+	// handoff, adoption, retry, queue drain). Close waits it out so no admitted
+	// operation is still touching the swarm when Close returns.
+	lifecycleWork sync.WaitGroup
+	watchers      sync.WaitGroup
+	closeOnce     sync.Once
+
 	mu        sync.Mutex
 	teams     map[string]*Team
 	taskCwd   map[string]string // taskID -> cwd, for handoff/adoption relaunch
-	scheduler *Scheduler        // lazily created by Scheduler(); nil until first use
+	taskRuns  map[string]*taskRun
+	scheduler *Scheduler // lazily created by Scheduler(); nil until first use
 	idSeq     atomic.Uint64
 }
 
@@ -90,6 +111,48 @@ type Member struct {
 	TaskID    string
 	handle    MemberHandle
 	restarts  int
+}
+
+// taskRun owns the cancellation and completion boundary for one coordinator
+// task. The context is shared by every bounded relaunch of that task; done is
+// closed only after no current or queued member can execute it.
+type taskRun struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+	once   sync.Once
+}
+
+func newTaskRun(parent context.Context) *taskRun {
+	ctx, cancel := context.WithCancel(parent)
+	return &taskRun{ctx: ctx, cancel: cancel, done: make(chan struct{})}
+}
+
+func (r *taskRun) stop() { r.cancel() }
+
+func (r *taskRun) stopped() bool {
+	select {
+	case <-r.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *taskRun) finish() {
+	r.once.Do(func() {
+		r.cancel()
+		close(r.done)
+	})
+}
+
+func (r *taskRun) finished() bool {
+	select {
+	case <-r.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // New validates options and returns a Swarm.
@@ -124,43 +187,112 @@ func New(opts Options) (*Swarm, error) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	return &Swarm{
-		registry:    registry,
-		coord:       coord,
-		mailbox:     mb,
-		launcher:    opts.Launcher,
-		maxTeamSize: maxTeam,
-		baseCtx:     ctx,
-		cancel:      cancel,
-		teams:       map[string]*Team{},
-		taskCwd:     map[string]string{},
+		registry:           registry,
+		coord:              coord,
+		mailbox:            mb,
+		launcher:           opts.Launcher,
+		maxTeamSize:        maxTeam,
+		handoffStopTimeout: defaultHandoffStopTimeout,
+		baseCtx:            ctx,
+		cancel:             cancel,
+		teams:              map[string]*Team{},
+		taskCwd:            map[string]string{},
+		taskRuns:           map[string]*taskRun{},
 	}, nil
 }
 
 // Close cancels every running member's context and releases resources. It is
-// safe to call more than once. The scheduler is closed first so no new spawn
-// fires after shutdown begins.
+// safe to call more than once. It closes lifecycle admission before canceling
+// members, fails queued tasks, and waits for every member watcher to exit.
 func (s *Swarm) Close() {
-	s.mu.Lock()
-	sched := s.scheduler
-	s.mu.Unlock()
-	if sched != nil {
-		sched.Close()
-	}
-	if s.cancel != nil {
-		s.cancel()
-	}
+	s.closeOnce.Do(func() {
+		// Closing admission and cancelling are separate steps on purpose. The flag
+		// flips under lifecycleMu so no further work is admitted, and the lock is
+		// released BEFORE cancelling: a member already being launched holds no lock
+		// here, but it may be blocked inside MemberLauncher.Launch waiting for the
+		// context this cancel provides, and it can only release its admission ticket
+		// once that cancellation lands.
+		s.lifecycleMu.Lock()
+		s.closed = true
+		s.mu.Lock()
+		sched := s.scheduler
+		s.mu.Unlock()
+		s.lifecycleMu.Unlock()
+
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if sched != nil {
+			sched.Close()
+		}
+		// Wait for every already-admitted lifecycle operation (spawn, handoff,
+		// adoption, retry, queue drain) to finish BEFORE sweeping queues below.
+		// Such work can create teams as well as append to their queues, so snapshot
+		// the teams only after every ticket is back. At that point no team or queue
+		// can gain a new entry, and the sweep cannot miss late-admitted work.
+		s.lifecycleWork.Wait()
+		s.mu.Lock()
+		teams := make([]*Team, 0, len(s.teams))
+		for _, team := range s.teams {
+			teams = append(teams, team)
+		}
+		s.mu.Unlock()
+		for _, team := range teams {
+			for _, spec := range team.clearQueue() {
+				_ = s.coord.Fail(spec.TaskID, ErrSwarmClosed.Error())
+				s.finishTaskRun(spec.TaskID)
+			}
+		}
+		// Every watcher is added while its admitting lifecycle ticket is still held,
+		// so lifecycleWork.Wait above also orders every Add before this Wait. The
+		// watcher itself can outlive that ticket, which is why both waits are needed.
+		s.watchers.Wait()
+	})
 }
 
 // Scheduler returns the swarm's recurring-spawn scheduler, creating it on first
 // use. Scheduling is opt-in: until a job is added the scheduler does nothing.
+//
+// The post-close handoff between this method and Close relies on the ORDER in
+// which each reads/writes s.scheduler and s.closed, not on holding one lock across
+// both: Close takes lifecycleMu.Lock() (excluding this RLock), sets closed, reads
+// whatever s.scheduler currently is, and only THEN releases lifecycleMu and calls
+// sched.Close() on what it captured. So a call here either:
+//   - runs entirely before Close's write lock — sees closed == false, and the
+//     scheduler it creates/returns is exactly the one Close's later snapshot will
+//     capture and close; or
+//   - runs entirely after Close's write lock — sees closed == true (memory model:
+//     the RLock/Lock pair orders the read after Close's write) and closes the
+//     scheduler itself here, because Close already captured its own snapshot
+//     (possibly nil, if this call is what first creates one) and will not look
+//     again.
+//
+// Either way exactly one of the two call sites closes the scheduler that ends up
+// installed, and neither can observe a "created after close but never closed"
+// scheduler — that would require reading closed == false here while also reading
+// a scheduler Close had already passed over, which the lock ordering rules out.
 func (s *Swarm) Scheduler() *Scheduler {
+	s.lifecycleMu.RLock()
+	closed := s.closed
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.scheduler == nil {
 		s.scheduler = newScheduler(s)
 	}
-	return s.scheduler
+	sched := s.scheduler
+	s.mu.Unlock()
+	s.lifecycleMu.RUnlock()
+	if closed {
+		sched.Close()
+	}
+	return sched
 }
+
+// ErrSwarmClosed reports lifecycle work submitted after shutdown begins.
+var ErrSwarmClosed = errors.New("swarm: closed")
+
+// ErrHandoffStopTimeout means the source member ignored cancellation long
+// enough that the handoff declined to start a successor.
+var ErrHandoffStopTimeout = errors.New("swarm: handoff source did not stop before timeout")
 
 // rememberCwd records a task's working dir so a handoff/adoption relaunch keeps it.
 func (s *Swarm) rememberCwd(taskID, cwd string) {
@@ -174,6 +306,42 @@ func (s *Swarm) cwdFor(taskID string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.taskCwd[taskID]
+}
+
+// startTaskRun installs a fresh execution boundary for taskID. Freshly spawned
+// tasks use unique ids; orphan adoption intentionally replaces the completed
+// boundary for the task it is reviving under a new member.
+func (s *Swarm) startTaskRun(taskID string) *taskRun {
+	run := newTaskRun(s.baseCtx)
+	s.mu.Lock()
+	s.taskRuns[taskID] = run
+	s.mu.Unlock()
+	return run
+}
+
+// ensureTaskRun returns the task's execution boundary, creating one for
+// internal/adopted paths that registered a coordinator task directly.
+func (s *Swarm) ensureTaskRun(taskID string) *taskRun {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if run := s.taskRuns[taskID]; run != nil {
+		return run
+	}
+	run := newTaskRun(s.baseCtx)
+	s.taskRuns[taskID] = run
+	return run
+}
+
+func (s *Swarm) taskRun(taskID string) *taskRun {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.taskRuns[taskID]
+}
+
+func (s *Swarm) finishTaskRun(taskID string) {
+	if run := s.taskRun(taskID); run != nil {
+		run.finish()
+	}
 }
 
 // Registry exposes the roster (for tool listing / user-defined registration).
@@ -286,6 +454,39 @@ func (t *Team) onExit() (MemberSpec, bool) {
 		return next, true
 	}
 	return MemberSpec{}, false
+}
+
+func (t *Team) releaseSlot() {
+	t.mu.Lock()
+	if t.running > 0 {
+		t.running--
+	}
+	t.mu.Unlock()
+}
+
+func (t *Team) clearQueue() []MemberSpec {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	queued := t.queue
+	t.queue = nil
+	return queued
+}
+
+// removeQueuedTask cancels a handoff source that has not taken a running slot
+// yet. It closes the queue/dequeue race under the same lock used by onExit.
+func (t *Team) removeQueuedTask(taskID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range t.queue {
+		if t.queue[i].TaskID != taskID {
+			continue
+		}
+		copy(t.queue[i:], t.queue[i+1:])
+		t.queue[len(t.queue)-1] = MemberSpec{}
+		t.queue = t.queue[:len(t.queue)-1]
+		return true
+	}
+	return false
 }
 
 func (t *Team) addMember(m *Member) {

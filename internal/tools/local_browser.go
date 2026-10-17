@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/localcontrol"
+	"github.com/Twigpine/zero/internal/localcontrol"
 )
 
 const localBrowserOutputBudgetBytes = 128 * 1024
@@ -45,6 +45,7 @@ func newBrowserInstallTool(options localcontrol.BrowserOptions) Tool {
 	return browserInstallTool{
 		baseTool: baseTool{
 			name:        "browser_install",
+			deferred:    true,
 			description: "Install the local browser runtime used by browser automation.",
 			parameters: Schema{
 				Type: "object",
@@ -53,7 +54,8 @@ func newBrowserInstallTool(options localcontrol.BrowserOptions) Tool {
 				},
 				AdditionalProperties: false,
 			},
-			safety: localControlSafety(options.Enabled, SideEffectLocalBrowser, "Downloads browser runtime files for local browser automation."),
+			safety:       localControlSafety(options.Enabled, SideEffectLocalBrowser, "Downloads browser runtime files for local browser automation."),
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false, ResourceKeys: sessionResourceKeys},
 		},
 		browser: localcontrol.NewBrowser(options),
 	}
@@ -85,6 +87,7 @@ func newBrowserLaunchToolWithLauncher(options localcontrol.BrowserOptions, launc
 	return browserLaunchTool{
 		baseTool: baseTool{
 			name:        "browser_launch",
+			deferred:    true,
 			description: "Launch a supported local Chromium/Electron app with Chrome DevTools enabled and attach browser automation to it. Use this for installed Electron apps such as Discord instead of launching GUI apps through shell commands.",
 			parameters: Schema{
 				Type: "object",
@@ -98,7 +101,8 @@ func newBrowserLaunchToolWithLauncher(options localcontrol.BrowserOptions, launc
 				Required:             []string{"app"},
 				AdditionalProperties: false,
 			},
-			safety: localControlSafety(options.Enabled, SideEffectLocalBrowser, "Launches a supported local Chromium/Electron app with DevTools enabled and attaches local browser automation."),
+			safety:       localControlSafety(options.Enabled, SideEffectLocalBrowser, "Launches a supported local Chromium/Electron app with DevTools enabled and attaches local browser automation."),
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false, ResourceKeys: sessionResourceKeys},
 		},
 		browser:  localcontrol.NewBrowser(options),
 		launcher: launcher,
@@ -163,6 +167,7 @@ func newBrowserConnectTool(options localcontrol.BrowserOptions) Tool {
 	return browserConnectTool{
 		baseTool: baseTool{
 			name:        "browser_connect",
+			deferred:    true,
 			description: "Attach local browser automation to an existing Chrome/Electron DevTools endpoint. For Electron apps, first launch the app with --remote-debugging-port=<port>, then connect to that port instead of using desktop control.",
 			parameters: Schema{
 				Type: "object",
@@ -172,7 +177,8 @@ func newBrowserConnectTool(options localcontrol.BrowserOptions) Tool {
 				Required:             []string{"target"},
 				AdditionalProperties: false,
 			},
-			safety: localControlSafety(options.Enabled, SideEffectLocalBrowser, "Attaches to a local browser or Electron app exposed over the Chrome DevTools Protocol."),
+			safety:       localControlSafety(options.Enabled, SideEffectLocalBrowser, "Attaches to a local browser or Electron app exposed over the Chrome DevTools Protocol."),
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false, ResourceKeys: sessionResourceKeys},
 		},
 		browser: localcontrol.NewBrowser(options),
 	}
@@ -202,6 +208,7 @@ func newBrowserOpenTool(options localcontrol.BrowserOptions) Tool {
 	return browserOpenTool{
 		baseTool: baseTool{
 			name:        "browser_open",
+			deferred:    true,
 			description: "Open a URL in the local browser automation session.",
 			parameters: Schema{
 				Type: "object",
@@ -211,7 +218,8 @@ func newBrowserOpenTool(options localcontrol.BrowserOptions) Tool {
 				Required:             []string{"url"},
 				AdditionalProperties: false,
 			},
-			safety: localControlSafety(options.Enabled, SideEffectNetwork, "Opens a URL through the local browser automation helper. For already-running Chrome/Electron apps, use browser_connect instead. If first use reports a missing browser runtime, run browser_install once."),
+			safety:       localControlSafety(options.Enabled, SideEffectNetwork, "Opens a URL through the local browser automation helper. For already-running Chrome/Electron apps, use browser_connect instead. If first use reports a missing browser runtime, run browser_install once."),
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false, ResourceKeys: sessionResourceKeys},
 		},
 		browser: localcontrol.NewBrowser(options),
 	}
@@ -241,6 +249,7 @@ func newBrowserSnapshotTool(options localcontrol.BrowserOptions) Tool {
 	return browserSnapshotTool{
 		baseTool: baseTool{
 			name:        "browser_snapshot",
+			deferred:    true,
 			description: "Return an accessibility snapshot from the current local browser automation session.",
 			parameters: Schema{
 				Type: "object",
@@ -253,7 +262,8 @@ func newBrowserSnapshotTool(options localcontrol.BrowserOptions) Tool {
 				},
 				AdditionalProperties: false,
 			},
-			safety: localControlSafety(options.Enabled, SideEffectLocalBrowser, "Reads the current local browser automation session state."),
+			safety:       localControlSafety(options.Enabled, SideEffectLocalBrowser, "Reads the current local browser automation session state."),
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false, ResourceKeys: sessionResourceKeys},
 		},
 		browser: localcontrol.NewBrowser(options),
 	}
@@ -283,6 +293,7 @@ func newBrowserClickTool(options localcontrol.BrowserOptions) Tool {
 	return browserClickTool{
 		baseTool: baseTool{
 			name:        "browser_click",
+			deferred:    true,
 			description: "Click a ref from browser_snapshot in the current local browser automation session.",
 			parameters: Schema{
 				Type: "object",
@@ -292,7 +303,8 @@ func newBrowserClickTool(options localcontrol.BrowserOptions) Tool {
 				Required:             []string{"ref"},
 				AdditionalProperties: false,
 			},
-			safety: localControlSafety(options.Enabled, SideEffectLocalBrowser, "Clicks an element in the local browser automation session."),
+			safety:       localControlSafety(options.Enabled, SideEffectLocalBrowser, "Clicks an element in the local browser automation session."),
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false, ResourceKeys: sessionResourceKeys},
 		},
 		browser: localcontrol.NewBrowser(options),
 	}
@@ -322,6 +334,7 @@ func newBrowserTypeTool(options localcontrol.BrowserOptions) Tool {
 	return browserTypeTool{
 		baseTool: baseTool{
 			name:        "browser_type",
+			deferred:    true,
 			description: "Type text into a ref from browser_snapshot in the current local browser automation session.",
 			parameters: Schema{
 				Type: "object",
@@ -332,7 +345,8 @@ func newBrowserTypeTool(options localcontrol.BrowserOptions) Tool {
 				Required:             []string{"ref", "text"},
 				AdditionalProperties: false,
 			},
-			safety: localControlSafety(options.Enabled, SideEffectLocalBrowser, "Types text into an element in the local browser automation session."),
+			safety:       localControlSafety(options.Enabled, SideEffectLocalBrowser, "Types text into an element in the local browser automation session."),
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false, ResourceKeys: sessionResourceKeys},
 		},
 		browser: localcontrol.NewBrowser(options),
 	}
@@ -362,6 +376,7 @@ func newBrowserPressTool(options localcontrol.BrowserOptions) Tool {
 	return browserPressTool{
 		baseTool: baseTool{
 			name:        "browser_press",
+			deferred:    true,
 			description: "Press a keyboard key in the current local browser automation session.",
 			parameters: Schema{
 				Type: "object",
@@ -371,7 +386,8 @@ func newBrowserPressTool(options localcontrol.BrowserOptions) Tool {
 				Required:             []string{"key"},
 				AdditionalProperties: false,
 			},
-			safety: localControlSafety(options.Enabled, SideEffectLocalBrowser, "Presses a key in the local browser automation session."),
+			safety:       localControlSafety(options.Enabled, SideEffectLocalBrowser, "Presses a key in the local browser automation session."),
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false, ResourceKeys: sessionResourceKeys},
 		},
 		browser: localcontrol.NewBrowser(options),
 	}
@@ -446,6 +462,7 @@ func newBrowserActionTool(options localcontrol.BrowserOptions) Tool {
 	return browserActionTool{
 		baseTool: baseTool{
 			name:        "browser_action",
+			deferred:    true,
 			description: "Run an allowed action against the current local browser automation session.",
 			parameters: Schema{
 				Type: "object",
@@ -456,7 +473,8 @@ func newBrowserActionTool(options localcontrol.BrowserOptions) Tool {
 				Required:             []string{"command"},
 				AdditionalProperties: false,
 			},
-			safety: localControlSafety(options.Enabled, SideEffectLocalBrowser, "Interacts with the local browser automation session."),
+			safety:       localControlSafety(options.Enabled, SideEffectLocalBrowser, "Interacts with the local browser automation session."),
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false, ResourceKeys: sessionResourceKeys},
 		},
 		browser: localcontrol.NewBrowser(options),
 	}
@@ -530,11 +548,11 @@ func browserActionArgs(args map[string]any) (string, []string, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	command = strings.ToLower(strings.TrimSpace(command))
-	spec, ok := browserActionSpecs[command]
+	command, ok := NormalizedBrowserActionCommand(command)
 	if !ok {
 		return "", nil, fmt.Errorf("command must be one of: %s", strings.Join(browserActionCommandNames(), ", "))
 	}
+	spec := browserActionSpecs[command]
 	values, err := stringArrayArg(args, "args")
 	if err != nil {
 		return "", nil, err
@@ -550,6 +568,16 @@ func browserActionArgs(args map[string]any) (string, []string, error) {
 		return "", nil, err
 	}
 	return command, commandArgs, nil
+}
+
+// NormalizedBrowserActionCommand returns the exact action that browser_action
+// will execute after normalizing its command argument. ACP uses it only for a
+// permission title, so an unrecognised command is never reflected as text that
+// the tool would reject.
+func NormalizedBrowserActionCommand(command string) (string, bool) {
+	command = strings.ToLower(strings.TrimSpace(command))
+	_, ok := browserActionSpecs[command]
+	return command, ok
 }
 
 func browserActionCommandArgs(command string, spec browserActionSpec, values []string) ([]string, error) {
@@ -639,6 +667,13 @@ func browserOpenURLArg(args map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return NormalizeBrowserOpenURL(rawURL)
+}
+
+// NormalizeBrowserOpenURL applies the browser_open URL rules before execution.
+// Keeping this exported within the internal package lets permission displays
+// describe the same destination the browser helper will open.
+func NormalizeBrowserOpenURL(rawURL string) (string, error) {
 	normalized := strings.TrimSpace(rawURL)
 	if !strings.Contains(normalized, "://") {
 		normalized = "https://" + normalized

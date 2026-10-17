@@ -11,8 +11,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/dictation"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/dictation"
 )
 
 // Transcriber and Recorder are re-exported so Options and the model can refer to
@@ -61,6 +61,7 @@ type dictationController struct {
 	browseVariants []dictation.ModelVariant
 
 	// in-flight session state
+	sessionID   int64
 	streaming   bool
 	recorder    Recorder
 	transcriber Transcriber
@@ -76,9 +77,12 @@ type dictationController struct {
 	regionStart  int
 	regionEnd    int
 	regionPrefix string
+	// regionRendered is the exact text last inserted into [regionStart,
+	// regionEnd). A later partial or cancel may remove that range only while it
+	// still matches, so stale bounds never consume user replacement text.
+	regionRendered string
 	// regionAnchor snapshots the text BEFORE the live region, so the next
-	// partial can detect external edits (typing, paste) and shift [start,end)
-	// to stay aligned. Updated alongside regionStart on each render.
+	// partial can detect edits before the tracked range.
 	regionAnchor string
 
 	// waveBars is the recording waveform's recent bar heights (a scrolling ring):
@@ -87,7 +91,7 @@ type dictationController struct {
 	waveBars []int
 	waveTick int
 
-	// voiceModeEnabled repurposes Space into hold-to-record (§13.9).
+	// voiceModeEnabled repurposes Ctrl+Space into hold-to-record (§13.9).
 	voiceModeEnabled bool
 	// eventTypesSupported records whether the terminal confirmed key-release
 	// reporting (Kitty protocol); eventTypesKnown gates it until the terminal has
@@ -101,13 +105,17 @@ type dictationController struct {
 }
 
 // dictationStartedMsg reports the outcome of Recorder.Start().
+// sessionID must match the dictation controller's current session so a late
+// start result after cancel/reset cannot reset a newer recording.
 type dictationStartedMsg struct {
-	err error
+	sessionID int64
+	err       error
 }
 
 // dictationTranscribedMsg carries the final transcript of a batch (or a
 // completed streaming) recording.
 type dictationTranscribedMsg struct {
+	sessionID int64
 	text      string
 	err       error
 	submit    bool
@@ -125,6 +133,7 @@ func newDictationController(opts Options) dictationController {
 		platform:       dictation.DetectPlatform(),
 		downloadRoot:   opts.STTDownloadRoot,
 		userConfigPath: opts.UserConfigPath,
+		sessionID:      1,
 	}
 }
 
@@ -167,7 +176,7 @@ func firstNonEmptyStr(a, b string) string {
 func (d dictationController) active() bool { return d.phase != dictIdle }
 
 // toggleDictation starts a recording when idle and stops-and-transcribes when
-// recording. Invoked by the voice-mode Space gesture; a call during
+// recording. Invoked by the voice-mode Ctrl+Space gesture; a call during
 // startup/transcription is ignored (the machine is mid-transition).
 func (m model) toggleDictation() (model, tea.Cmd) {
 	if !m.dictation.available() {
@@ -187,21 +196,21 @@ func (m model) toggleDictation() (model, tea.Cmd) {
 	}
 }
 
-// toggleVoiceMode flips the /voice hold-to-record gesture — the dictation
-// trigger. While on, Space records; run /voice again to type spaces normally.
+// toggleVoiceMode flips the /voice hold-to-record gesture. While on,
+// Ctrl+Space records and ordinary Space continues to type normally.
 func (m model) toggleVoiceMode() (model, tea.Cmd) {
 	if !m.dictation.available() {
 		return m.appendSystemNotice("Dictation is not configured. See docs/dictation.md to set up a local engine or a Groq/OpenAI key."), nil
 	}
 	m.dictation.voiceModeEnabled = !m.dictation.voiceModeEnabled
 	if m.dictation.voiceModeEnabled {
-		return m.appendSystemNotice("Voice mode on (" + m.dictation.currentModelLabel() + ") — hold Space to dictate, release to transcribe. Run /voice again to turn it off (so Space types normally)."), nil
+		return m.showTransientNoticeInline("Voice mode on — "+voiceCaptureUsage+". Run /voice again to turn it off.", transientNoticeSuccess), nil
 	}
 	// Turning voice off is the "done dictating" signal, so release the warm sherpa
 	// streaming server — otherwise a loaded model keeps idling in RAM (and holding
 	// its port) until the app exits. It respawns lazily on the next streaming
 	// recording. Skip while a recording is still in flight so we don't kill it.
-	next := m.appendSystemNotice("Voice mode off.")
+	next := m.showTransientNoticeInline("Voice mode off.", transientNoticeInfo)
 	if next.dictation.active() {
 		return next, nil
 	}
@@ -262,7 +271,7 @@ func (m model) startDictation() (model, tea.Cmd) {
 	if streaming {
 		return m.startStreamingDictation()
 	}
-	return m, startBatchRecordingCmd(rec)
+	return m, startBatchRecordingCmd(m.dictation.sessionID, rec)
 }
 
 // stopDictation ends a recording. For batch it triggers Stop()+Transcribe(); for
@@ -276,7 +285,7 @@ func (m model) stopDictation() (model, tea.Cmd) {
 		}
 		return m, nil // final text arrives via the streaming command already running
 	}
-	return m, transcribeBatchCmd(m.dictation.ctx, m.dictation.recorder, m.dictation.transcriber, m.dictation.cfg.AutoSubmitEnabled())
+	return m, transcribeBatchCmd(m.dictation.sessionID, m.dictation.ctx, m.dictation.recorder, m.dictation.transcriber, m.dictation.cfg.AutoSubmitEnabled())
 }
 
 // cancelDictation aborts an in-flight recording without transcribing. Bound to
@@ -293,7 +302,7 @@ func (m model) cancelDictation() (model, tea.Cmd) {
 	}
 	m = m.discardDictationRegion()
 	m.dictation.reset()
-	return m.appendSystemNotice("Dictation cancelled."), nil
+	return m.showTransientNoticeInline("Dictation cancelled.", transientNoticeInfo), nil
 }
 
 // wantStreaming decides whether this recording uses the streaming pipeline:
@@ -311,6 +320,7 @@ func (d dictationController) maxDuration() time.Duration {
 }
 
 func (d *dictationController) reset() {
+	d.sessionID++
 	d.phase = dictIdle
 	d.recorder = nil
 	d.transcriber = nil
@@ -320,37 +330,43 @@ func (d *dictationController) reset() {
 	d.streamStop = nil
 	d.regionActive = false
 	d.regionPrefix = ""
+	d.regionRendered = ""
 	d.waveBars = nil
 	d.waveTick = 0
 }
 
 // startBatchRecordingCmd starts the record-to-file capture off the UI goroutine
 // (Start spawns a subprocess and may briefly block or fail on a missing tool).
-func startBatchRecordingCmd(rec Recorder) tea.Cmd {
+func startBatchRecordingCmd(sessionID int64, rec Recorder) tea.Cmd {
 	return func() tea.Msg {
-		return dictationStartedMsg{err: rec.Start()}
+		return dictationStartedMsg{sessionID: sessionID, err: rec.Start()}
 	}
 }
 
 // transcribeBatchCmd stops the recording, transcribes the audio, and reports the
 // final text. Runs off the UI goroutine — Stop waits on the capture tool and
 // Transcribe does a network round-trip or a local exec.
-func transcribeBatchCmd(ctx context.Context, rec Recorder, transcriber Transcriber, submit bool) tea.Cmd {
+func transcribeBatchCmd(sessionID int64, ctx context.Context, rec Recorder, transcriber Transcriber, submit bool) tea.Cmd {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	return func() tea.Msg {
 		audio, err := rec.Stop()
 		if err != nil {
-			return dictationTranscribedMsg{err: err}
+			return dictationTranscribedMsg{sessionID: sessionID, err: err}
 		}
 		text, err := transcriber.Transcribe(ctx, audio)
-		return dictationTranscribedMsg{text: text, err: err, submit: submit}
+		return dictationTranscribedMsg{sessionID: sessionID, text: text, err: err, submit: submit}
 	}
 }
 
 // handleDictationStarted transitions to recording (or reports a start failure).
 func (m model) handleDictationStarted(msg dictationStartedMsg) (model, tea.Cmd) {
+	if msg.sessionID != m.dictation.sessionID {
+		// Stale startup from a cancelled session must not reset or re-arm a
+		// newer recording that already owns the controller.
+		return m, nil
+	}
 	if msg.err != nil {
 		m = m.discardDictationRegion()
 		m.dictation.reset()
@@ -362,7 +378,7 @@ func (m model) handleDictationStarted(msg dictationStartedMsg) (model, tea.Cmd) 
 	if m.dictation.phase == dictStarting {
 		m.dictation.phase = dictRecording
 	}
-	// A voice-mode Space release that arrived mid-startup asked us to stop as soon
+	// A voice-mode Ctrl+Space release that arrived mid-startup asked us to stop as soon
 	// as recording began.
 	if m.dictation.voiceStopPending && m.dictation.phase == dictRecording {
 		m.dictation.voiceStopPending = false
@@ -375,6 +391,9 @@ func (m model) handleDictationStarted(msg dictationStartedMsg) (model, tea.Cmd) 
 // handleDictationTranscribed inserts the final transcript into the composer (or
 // submits it when stt.autoSubmit is on), then returns to idle.
 func (m model) handleDictationTranscribed(msg dictationTranscribedMsg) (tea.Model, tea.Cmd) {
+	if msg.sessionID != m.dictation.sessionID {
+		return m, nil
+	}
 	streaming := m.dictation.streaming || msg.streaming
 	m = m.commitDictationRegion()
 	// A streaming session can end via a transcriber error (not just a user stop), so
@@ -392,7 +411,17 @@ func (m model) handleDictationTranscribed(msg dictationTranscribedMsg) (tea.Mode
 	}
 	m.dictation.reset()
 
-	if msg.err != nil && !errors.Is(msg.err, context.Canceled) {
+	if errors.Is(msg.err, context.Canceled) {
+		// cancelDictation already discarded the live region, reset the
+		// session, and posted "Dictation cancelled." A streaming transcriber
+		// can still race a buffered event past that cancel and report back a
+		// nonempty compose()+context.Canceled; treat that as terminal here,
+		// before the auto-submit branch below, so Esc can never fall through
+		// to msg.submit and fire the composer's restored pre-existing text.
+		return m, nil
+	}
+
+	if msg.err != nil {
 		// A cloud auth failure (missing/invalid key) is fixable in place: reopen the
 		// API-key prompt for the current provider so the user can paste a key and
 		// retry, instead of hitting a dead-end "run zero auth" line.
@@ -413,7 +442,7 @@ func (m model) handleDictationTranscribed(msg dictationTranscribedMsg) (tea.Mode
 		if streaming {
 			return m, nil // streaming already rendered live; nothing to add
 		}
-		return m.appendSystemNotice("No speech detected."), nil
+		return m.showTransientNoticeInline("No speech detected.", transientNoticeInfo), nil
 	}
 	if !streaming {
 		m = m.insertDictatedText(msg.text)
@@ -455,12 +484,8 @@ func needsLeadingSpace(state composerState) bool {
 func (m model) dictationStatusChip() string {
 	switch m.dictation.phase {
 	case dictStarting, dictRecording:
-		stop := "release Space to stop"
-		if !m.dictation.eventTypesSupported {
-			stop = "press Space to stop" // press-to-toggle fallback
-		}
 		wave := zeroTheme.amber.Render("● " + renderWaveBars(m.dictation.waveBars) + " REC")
-		return wave + zeroTheme.muted.Render(" · "+stop+", Esc to cancel")
+		return wave + zeroTheme.muted.Render(" · "+m.voiceCaptureStatus()+", Esc to cancel")
 	case dictTranscribing:
 		return zeroTheme.accent.Render("●") + " " + zeroTheme.muted.Render("transcribing…")
 	}
@@ -576,13 +601,12 @@ func (m model) handleRecTick() (model, tea.Cmd) {
 	return m, nil
 }
 
-// voiceModeIndicator renders the persistent "voice mode on" hint shown while
-// idle so the user knows Space is repurposed to hold-to-record (§10).
+// voiceModeIndicator renders the current voice gesture or transcription state.
 func (m model) voiceModeIndicator() string {
 	if !m.dictation.voiceModeEnabled {
 		return ""
 	}
-	return zeroTheme.accent.Render("🎙 voice") + zeroTheme.muted.Render(" · "+m.dictation.currentModelLabel())
+	return zeroTheme.accent.Render("🎙 voice") + zeroTheme.muted.Render(" · "+m.voiceCaptureStatus()+" · "+m.dictation.currentModelLabel())
 }
 
 // dictationErrorText renders a dictation error for the transcript: a missing-

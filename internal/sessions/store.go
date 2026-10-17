@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/fsutil"
+	"github.com/Twigpine/zero/internal/fsutil"
 )
 
 const (
@@ -45,6 +45,9 @@ const (
 	EventSpecDraft          EventType = "spec_draft"
 	EventSpecApproved       EventType = "spec_approved"
 	EventSpecRejected       EventType = "spec_rejected"
+	EventGoalCreated        EventType = "goal_created"
+	EventGoalUpdated        EventType = "goal_updated"
+	EventGoalCleared        EventType = "goal_cleared"
 )
 
 type SessionKind string
@@ -52,6 +55,7 @@ type SessionKind string
 const (
 	SessionKindFork      SessionKind = "fork"
 	SessionKindChild     SessionKind = "child"
+	SessionKindSide      SessionKind = "side"
 	SessionKindSpecDraft SessionKind = "spec-draft"
 	SessionKindSpecImpl  SessionKind = "spec-impl"
 )
@@ -64,12 +68,36 @@ const (
 	SpecStatusRejected SpecStatus = "rejected"
 )
 
+type GoalStatus string
+
+const (
+	GoalStatusActive        GoalStatus = "active"
+	GoalStatusPaused        GoalStatus = "paused"
+	GoalStatusBlocked       GoalStatus = "blocked"
+	GoalStatusBudgetLimited GoalStatus = "budget_limited"
+	GoalStatusUsageLimited  GoalStatus = "usage_limited"
+	GoalStatusComplete      GoalStatus = "complete"
+)
+
+type Goal struct {
+	Objective         string     `json:"objective"`
+	Status            GoalStatus `json:"status"`
+	StatusReason      string     `json:"statusReason,omitempty"`
+	TokenBudget       int        `json:"tokenBudget,omitempty"`
+	TokensUsed        int        `json:"tokensUsed,omitempty"`
+	ContinuationCount int        `json:"continuationCount,omitempty"`
+	ContinuationLimit int        `json:"continuationLimit,omitempty"`
+	CreatedAt         string     `json:"createdAt"`
+	UpdatedAt         string     `json:"updatedAt"`
+}
+
 type Metadata struct {
 	SessionID           string      `json:"sessionId"`
 	SessionKind         SessionKind `json:"sessionKind,omitempty"`
 	Title               string      `json:"title,omitempty"`
 	Cwd                 string      `json:"cwd,omitempty"`
 	ModelID             string      `json:"modelId,omitempty"`
+	PermissionMode      string      `json:"permissionMode,omitempty"`
 	Provider            string      `json:"provider,omitempty"`
 	Tag                 string      `json:"tag,omitempty"`
 	Depth               int         `json:"depth,omitempty"`
@@ -90,6 +118,7 @@ type Metadata struct {
 	SpecRejectReason    string      `json:"specRejectReason,omitempty"`
 	SpecSourceSessionID string      `json:"specSourceSessionId,omitempty"`
 	SpecImplSessionID   string      `json:"specImplSessionId,omitempty"`
+	Goal                *Goal       `json:"goal,omitempty"`
 	CreatedAt           string      `json:"createdAt"`
 	UpdatedAt           string      `json:"updatedAt"`
 	EventCount          int         `json:"eventCount"`
@@ -122,14 +151,17 @@ type CreateInput struct {
 	SpecRejectReason    string
 	SpecSourceSessionID string
 	SpecImplSessionID   string
+	Goal                *Goal
 }
 
 type ForkInput struct {
-	SessionID string
-	Title     string
-	Cwd       string
-	ModelID   string
-	Provider  string
+	SessionID   string
+	SessionKind SessionKind
+	Title       string
+	Cwd         string
+	ModelID     string
+	Provider    string
+	Tag         string
 }
 
 type ChildInput struct {
@@ -202,6 +234,11 @@ type Store struct {
 	// is accepted deliberately rather than risk an unsafe eviction.
 	sessionLocks map[string]*sync.Mutex
 	idCounter    atomic.Uint64
+
+	// leases are the sessions this Store holds open, with the path of each
+	// lease file. The files themselves belong to the process. See Hold.
+	leasesMu sync.Mutex
+	leases   map[string]string
 }
 
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
@@ -248,6 +285,14 @@ func (store *Store) Create(input CreateInput) (Metadata, error) {
 	if input.Depth < 0 {
 		return Metadata{}, fmt.Errorf("invalid zero session depth %d", input.Depth)
 	}
+	// A session created under a parent holds that parent, the way Fork and
+	// CreateChild do, and is refused while prune holds or is removing it: exec
+	// --calling-session-id and spec implementations create their children here.
+	if parent := strings.TrimSpace(input.ParentSessionID); parent != "" {
+		if err := store.holdParent(parent); err != nil {
+			return Metadata{}, err
+		}
+	}
 
 	timestamp := store.timestamp()
 	session := Metadata{
@@ -276,6 +321,7 @@ func (store *Store) Create(input CreateInput) (Metadata, error) {
 		SpecRejectReason:    strings.TrimSpace(input.SpecRejectReason),
 		SpecSourceSessionID: strings.TrimSpace(input.SpecSourceSessionID),
 		SpecImplSessionID:   strings.TrimSpace(input.SpecImplSessionID),
+		Goal:                cloneGoal(input.Goal),
 		CreatedAt:           timestamp,
 		UpdatedAt:           timestamp,
 		EventCount:          0,
@@ -300,6 +346,7 @@ func (store *Store) Create(input CreateInput) (Metadata, error) {
 	if err := file.Close(); err != nil {
 		return Metadata{}, fmt.Errorf("close zero session events file: %w", err)
 	}
+	store.Hold(sessionID)
 	return session, nil
 }
 
@@ -354,10 +401,9 @@ func (store *Store) Latest() (*Metadata, error) {
 }
 
 // IsResumableKind reports whether a session kind represents a standalone,
-// user-resumable conversation rather than an agent sub-run. Regular ("") and
-// user fork sessions are resumable; child (specialist/sub-agent) and spec
-// draft/impl sessions are not — each agent task and /spec run creates one, so
-// listing them in the resume picker floods it with non-conversation entries.
+// user-resumable conversation rather than a transient or agent-owned sub-run.
+// Regular ("") and user fork sessions are resumable; side, child, and spec
+// sessions are not, so they do not flood the resume picker.
 func IsResumableKind(kind SessionKind) bool {
 	switch kind {
 	case "", SessionKindFork:
@@ -398,6 +444,9 @@ func (store *Store) Fork(parentSessionID string, input ForkInput) (Metadata, err
 	if !ValidSessionID(parentSessionID) {
 		return Metadata{}, fmt.Errorf("invalid zero session id %q", parentSessionID)
 	}
+	if err := store.holdParent(parentSessionID); err != nil {
+		return Metadata{}, err
+	}
 	parent, err := store.Get(parentSessionID)
 	if err != nil {
 		return Metadata{}, err
@@ -418,13 +467,21 @@ func (store *Store) Fork(parentSessionID string, input ForkInput) (Metadata, err
 	if title == "" && parent.Title != "" {
 		title = parent.Title + " (fork)"
 	}
+	kind := input.SessionKind
+	if kind == "" {
+		kind = SessionKindFork
+	}
+	if kind != SessionKindFork && kind != SessionKindSide {
+		return Metadata{}, fmt.Errorf("invalid zero fork session kind %q", kind)
+	}
 	fork, err := store.Create(CreateInput{
 		SessionID:          input.SessionID,
-		SessionKind:        SessionKindFork,
+		SessionKind:        kind,
 		Title:              title,
 		Cwd:                firstNonEmpty(input.Cwd, parent.Cwd),
 		ModelID:            firstNonEmpty(input.ModelID, parent.ModelID),
 		Provider:           firstNonEmpty(input.Provider, parent.Provider),
+		Tag:                input.Tag,
 		ParentSessionID:    parent.SessionID,
 		RootSessionID:      firstNonEmpty(parent.RootSessionID, parent.SessionID),
 		ForkedFromEventID:  last.ID,
@@ -680,7 +737,7 @@ func (store *Store) appendPreparedEventsLocked(sessionID string, inputs []prepar
 // serialized under the same per-session lock as AppendEvent and re-reads the
 // latest metadata under that lock before rewriting, so a concurrent append can't
 // clobber the new title (nor the title clobber a concurrent append's event
-// count/timestamp). UpdatedAt is deliberately left untouched: a retitle is not
+// count/timestamp). UpdatedAt is deliberately left untouched: a rename is not
 // activity, so it must not reorder the session in the resumable list. A blank
 // title is rejected so a failed model generation can never erase a useful
 // first-message title, and an unchanged title is a no-op (no rewrite/fsync).
@@ -712,16 +769,115 @@ func (store *Store) UpdateTitle(sessionID string, title string) (Metadata, error
 	return session, nil
 }
 
-func (store *Store) ReadEvents(sessionID string) ([]Event, error) {
+// UpdateTitleIfCurrent replaces a session title only when it still matches
+// expected. It lets background automatic naming avoid overwriting a newer manual
+// rename while keeping the check and write under the same per-session lock.
+func (store *Store) UpdateTitleIfCurrent(sessionID string, expected string, title string) (Metadata, bool, error) {
 	if !ValidSessionID(sessionID) {
-		return nil, fmt.Errorf("invalid zero session id %q", sessionID)
+		return Metadata{}, false, fmt.Errorf("invalid zero session id %q", sessionID)
+	}
+	trimmed := strings.TrimSpace(title)
+	if trimmed == "" {
+		return Metadata{}, false, fmt.Errorf("zero session title is required")
+	}
+	unlock, err := store.lockSession(sessionID)
+	if err != nil {
+		return Metadata{}, false, err
+	}
+	defer unlock()
+
+	session, err := store.readMetadata(sessionID)
+	if err != nil {
+		return Metadata{}, false, err
+	}
+	if session.Title != strings.TrimSpace(expected) {
+		return session, false, nil
+	}
+	if session.Title == trimmed {
+		return session, true, nil
+	}
+	session.Title = trimmed
+	if err := store.writeMetadata(session); err != nil {
+		return Metadata{}, false, err
+	}
+	return session, true, nil
+}
+
+// UpdateModel replaces a session's selected model without changing its activity
+// timestamp or event counters. An empty model clears the session override.
+func (store *Store) UpdateModel(sessionID string, modelID string) (Metadata, error) {
+	if !ValidSessionID(sessionID) {
+		return Metadata{}, fmt.Errorf("invalid zero session id %q", sessionID)
+	}
+	modelID = strings.TrimSpace(modelID)
+	unlock, err := store.lockSession(sessionID)
+	if err != nil {
+		return Metadata{}, err
+	}
+	defer unlock()
+
+	session, err := store.readMetadata(sessionID)
+	if err != nil {
+		return Metadata{}, err
+	}
+	if session.ModelID == modelID {
+		return session, nil
+	}
+	session.ModelID = modelID
+	if err := store.writeMetadata(session); err != nil {
+		return Metadata{}, err
+	}
+	return session, nil
+}
+
+// UpdateMode replaces a session's permission mode without changing its activity
+// timestamp or event counters. An empty mode clears the session override; the
+// stored value is not validated here because the reader that turns it back into
+// a live mode is the boundary that decides what a stored string may become.
+func (store *Store) UpdateMode(sessionID string, mode string) (Metadata, error) {
+	if !ValidSessionID(sessionID) {
+		return Metadata{}, fmt.Errorf("invalid zero session id %q", sessionID)
+	}
+	mode = strings.TrimSpace(mode)
+	unlock, err := store.lockSession(sessionID)
+	if err != nil {
+		return Metadata{}, err
+	}
+	defer unlock()
+
+	session, err := store.readMetadata(sessionID)
+	if err != nil {
+		return Metadata{}, err
+	}
+	if session.PermissionMode == mode {
+		return session, nil
+	}
+	session.PermissionMode = mode
+	if err := store.writeMetadata(session); err != nil {
+		return Metadata{}, err
+	}
+	return session, nil
+}
+
+func (store *Store) ReadEvents(sessionID string) ([]Event, error) {
+	events, _, err := store.ReadEventsWithPresence(sessionID)
+	return events, err
+}
+
+// ReadEventsWithPresence preserves the distinction between an intentionally
+// empty event log and a missing one. Most readers accept both as empty history,
+// but activation protocols that promise to restore previously populated
+// context need the stronger signal.
+func (store *Store) ReadEventsWithPresence(sessionID string) ([]Event, bool, error) {
+	if !ValidSessionID(sessionID) {
+		return nil, false, fmt.Errorf("invalid zero session id %q", sessionID)
 	}
 	data, err := os.ReadFile(store.eventsPath(sessionID))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return []Event{}, nil
+			return []Event{}, false, nil
 		}
-		return nil, fmt.Errorf("read zero session events: %w", err)
+		return nil, false, fmt.Errorf("read zero session events: %w", err)
 	}
 	// A genuine torn tail is an INCOMPLETE final write — a crash mid-append leaves
 	// the last line without its terminating newline. If the file ends with a
@@ -751,11 +907,11 @@ func (store *Store) ReadEvents(sessionID string) ([]Event, error) {
 			if index == lastNonEmpty && tornTailPossible {
 				break
 			}
-			return nil, fmt.Errorf("invalid json in zero session %s %s at line %d: %w", sessionID, EventsFile, index+1, err)
+			return nil, true, fmt.Errorf("invalid json in zero session %s %s at line %d: %w", sessionID, EventsFile, index+1, err)
 		}
 		events = append(events, event)
 	}
-	return events, nil
+	return events, true, nil
 }
 
 func (store *Store) timestamp() string {
@@ -788,6 +944,14 @@ func (store *Store) sessionLock(sessionID string) *sync.Mutex {
 // reverse order. The OS lock is best-effort: if it cannot be acquired (e.g. an
 // unsupported platform) the in-memory mutex still applies.
 func (store *Store) lockSession(sessionID string) (func(), error) {
+	// A process that writes a session has it open. See Hold.
+	store.Hold(sessionID)
+	return store.lockSessionWithoutLease(sessionID)
+}
+
+// lockSessionWithoutLease is lockSession for prune, which must not mark as open
+// the session it is about to remove.
+func (store *Store) lockSessionWithoutLease(sessionID string) (func(), error) {
 	mu := store.sessionLock(sessionID)
 	mu.Lock()
 	release, err := store.acquireFileLock(sessionID)

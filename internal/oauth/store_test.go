@@ -91,6 +91,60 @@ func TestStoreFileMode0600(t *testing.T) {
 	}
 }
 
+// TestStorePublishesThroughProtectedDirectory pins the publication contract the
+// sandbox profile relies on: the plaintext blob is never written to a path a
+// same-user process can predict (a fixed `.tmp` sibling), only to a random name
+// inside the directory the profile denies by name, and nothing is left behind.
+func TestStorePublishesThroughProtectedDirectory(t *testing.T) {
+	s, path := newTestStore(t)
+	if err := os.WriteFile(path+".tmp", []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(ProviderKey("x"), Token{AccessToken: "secret"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	// A predictable sibling is never used, so a pre-existing one is untouched
+	// rather than becoming the file the plaintext passes through.
+	if data, err := os.ReadFile(path + ".tmp"); err != nil || string(data) != "stale" {
+		t.Fatalf("fixed sibling data = %q, err = %v, want the untouched placeholder", data, err)
+	}
+	assertEmptyPublicationDir(t, path)
+}
+
+func TestEncryptedStorePublishesSecretThroughProtectedDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokens.json")
+	if err := os.WriteFile(path+".secret.tmp", []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(StoreOptions{FilePath: path, Storage: "encrypted-file"})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := s.Save(ProviderKey("x"), Token{AccessToken: "secret"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if data, err := os.ReadFile(path + ".secret.tmp"); err != nil || string(data) != "stale" {
+		t.Fatalf("fixed secret sibling data = %q, err = %v, want the untouched placeholder", data, err)
+	}
+	assertEmptyPublicationDir(t, path)
+	assertEmptyPublicationDir(t, path+".secret")
+}
+
+// assertEmptyPublicationDir asserts the store's publication directory exists
+// (so the sandbox has a mount target to mask on Linux) and holds no leftover
+// copy of the secret it published.
+func assertEmptyPublicationDir(t *testing.T, storePath string) {
+	t.Helper()
+	dir := PublicationDir(storePath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read publication dir %s: %v", dir, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("publication dir %s = %v, want empty after publish", dir, entries)
+	}
+}
+
 func TestStoreMalformedFailsClosed(t *testing.T) {
 	s, path := newTestStore(t)
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
@@ -141,5 +195,68 @@ func TestProviderKeyNormalizesCase(t *testing.T) {
 	}
 	if _, key, ok := FirstStored(store, []string{"xai"}); !ok || key != "provider:xai" {
 		t.Fatalf("candidate \"xai\" must find the mixed-case login, ok=%v key=%q", ok, key)
+	}
+}
+
+func TestStoreFileResetCleansPublicationResiduesAndSecretLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tokens.json")
+	s, err := NewStore(StoreOptions{FilePath: path, Encrypted: true})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	// 1. Perform initial save to establish encrypted store and .secret
+	if err := s.Save(ProviderKey("svc"), Token{AccessToken: "initial"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// 2. Simulate crash residues: publish-* in .publish and .secret.publish, and stale .secret.lock
+	pubDir := path + ".publish"
+	secPubDir := path + ".secret.publish"
+	if err := os.MkdirAll(pubDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll pubDir: %v", err)
+	}
+	if err := os.MkdirAll(secPubDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll secPubDir: %v", err)
+	}
+	strandedToken := filepath.Join(pubDir, "publish-stranded-token")
+	strandedSecret := filepath.Join(secPubDir, "publish-stranded-secret")
+	staleLock := path + ".secret.lock"
+	if err := os.WriteFile(strandedToken, []byte("token-residue"), 0o600); err != nil {
+		t.Fatalf("write strandedToken: %v", err)
+	}
+	if err := os.WriteFile(strandedSecret, []byte("secret-residue"), 0o600); err != nil {
+		t.Fatalf("write strandedSecret: %v", err)
+	}
+	if err := os.WriteFile(staleLock, []byte("stale-lock"), 0o600); err != nil {
+		t.Fatalf("write staleLock: %v", err)
+	}
+
+	// 3. Reset the store
+	if err := s.Reset(); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+
+	// 4. Verify all secret-bearing artifacts and locks are removed
+	for _, p := range []string{path, path + ".secret", strandedToken, strandedSecret, staleLock} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("file %s should be removed by Reset, stat err=%v", p, err)
+		}
+	}
+	// Publication dirs themselves should be preserved
+	for _, d := range []string{pubDir, secPubDir} {
+		if _, err := os.Stat(d); err != nil {
+			t.Errorf("publication directory %s should be preserved, stat err=%v", d, err)
+		}
+	}
+
+	// 5. Verify fresh encrypted Save/Load succeeds
+	if err := s.Save(ProviderKey("svc2"), Token{AccessToken: "fresh"}); err != nil {
+		t.Fatalf("Save after Reset: %v", err)
+	}
+	tok, ok, err := s.Load(ProviderKey("svc2"))
+	if err != nil || !ok || tok.AccessToken != "fresh" {
+		t.Fatalf("Load after Reset = (%v, %v, %v), want fresh token", tok, ok, err)
 	}
 }

@@ -6,12 +6,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/providercatalog"
-	"github.com/Gitlawb/zero/internal/providers"
-	"github.com/Gitlawb/zero/internal/redaction"
-	"github.com/Gitlawb/zero/internal/sessions"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/providercatalog"
+	"github.com/Twigpine/zero/internal/providers"
+	"github.com/Twigpine/zero/internal/redaction"
+	"github.com/Twigpine/zero/internal/sessions"
 )
 
 const RuntimeGo = "go"
@@ -132,14 +132,6 @@ type SessionTreeSnapshot struct {
 
 func UsageError(message string) CommandError {
 	return CommandError{Kind: ErrorKindUsage, Message: strings.TrimSpace(message)}
-}
-
-func RuntimeError(message string) CommandError {
-	return CommandError{Kind: ErrorKindRuntime, Message: strings.TrimSpace(message)}
-}
-
-func ProviderError(message string) CommandError {
-	return CommandError{Kind: ErrorKindProvider, Message: strings.TrimSpace(message), Recoverable: true}
 }
 
 func ConfigSnapshotFromResolved(resolved config.ResolvedConfig) ConfigSnapshot {

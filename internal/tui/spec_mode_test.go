@@ -9,11 +9,11 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/Gitlawb/zero/internal/agent"
-	"github.com/Gitlawb/zero/internal/sessions"
-	"github.com/Gitlawb/zero/internal/specmode"
-	"github.com/Gitlawb/zero/internal/tools"
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/agent"
+	"github.com/Twigpine/zero/internal/sessions"
+	"github.com/Twigpine/zero/internal/specmode"
+	"github.com/Twigpine/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 func TestSpecCommandCreatesDraftReview(t *testing.T) {
@@ -194,7 +194,7 @@ func TestSpecReviewRejectLaunchesQueuedPrompt(t *testing.T) {
 
 func newSpecModeTestModel(root string, provider zeroruntime.Provider, store *sessions.Store) model {
 	registry := tools.NewRegistry()
-	for _, tool := range tools.CoreTools(root) {
+	for _, tool := range tools.CoreToolsScoped(root, nil) {
 		registry.Register(tool)
 	}
 	return newModel(context.Background(), Options{

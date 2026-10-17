@@ -5,8 +5,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/tools"
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 // countingSchemaTool records how many times its Parameters() schema is read, so a
@@ -29,6 +29,19 @@ func (t countingSchemaTool) Safety() tools.Safety {
 }
 func (t countingSchemaTool) Run(_ context.Context, _ map[string]any) tools.Result {
 	return tools.Result{Status: tools.StatusOK}
+}
+
+func TestRuntimeToolDefinitionMarksOnlyBuiltInApplyPatchFreeform(t *testing.T) {
+	builtIn := runtimeToolDefinition(tools.NewScopedApplyPatchTool(t.TempDir(), nil))
+	if builtIn.Type != zeroruntime.ToolDefinitionFreeform {
+		t.Fatalf("built-in apply_patch type = %q, want freeform", builtIn.Type)
+	}
+
+	calls := 0
+	custom := runtimeToolDefinition(countingSchemaTool{name: "apply_patch", calls: &calls})
+	if custom.Type != "" {
+		t.Fatalf("custom apply_patch type = %q, want legacy function shape", custom.Type)
+	}
 }
 
 // The cache renders a tool's schema once and reuses it across calls, and its

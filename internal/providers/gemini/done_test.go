@@ -4,12 +4,13 @@ import (
 	"context"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 // emitDone must mark the shared state done so callers observe it through the
 // pointer (a by-value receiver would make state.done a dead store).
 func TestEmitDoneMarksStateDoneThroughPointer(t *testing.T) {
+	t.Parallel()
 	provider, err := New(Options{Model: "gemini-test"})
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)

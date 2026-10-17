@@ -10,10 +10,10 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/Gitlawb/zero/internal/agent"
-	"github.com/Gitlawb/zero/internal/config"
-	internalmcp "github.com/Gitlawb/zero/internal/mcp"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/agent"
+	"github.com/Twigpine/zero/internal/config"
+	internalmcp "github.com/Twigpine/zero/internal/mcp"
+	"github.com/Twigpine/zero/internal/tools"
 )
 
 func applyCommandResult(t *testing.T, m model, cmd tea.Cmd) model {
@@ -47,9 +47,10 @@ func TestFormatCommandHelpLinesGroupsCommandsByStableOrder(t *testing.T) {
 		"model:",
 		"  /provider [add|status] - Manage providers: activate, add, edit, delete.",
 		"  /model [list|id] - Show or switch the active model.",
-		"  /effort [list|low|medium|high|auto] - Show or set reasoning effort for supported models.",
+		"  /effort [list|level|auto] - Show or set reasoning effort for supported models.",
+		"  /fast - Toggle fast mode for supported ChatGPT subscription models.",
 		"session:",
-		"  /plan - Show planning mode status.",
+		"  /plan [status|on|off] - Show plan status, or enter/exit read-only planning mode.",
 		"runtime:",
 		"  /permissions - Show the active permission mode and sandbox grants.",
 		"  /debug (/debug-mode) - Show debug mode status.",
@@ -976,12 +977,39 @@ func TestParseBackgroundTerminalCommands(t *testing.T) {
 		{input: "/ps", kind: commandPS, text: ""},
 		{input: "/stop", kind: commandStop, text: ""},
 		{input: "/stop 1000", kind: commandStop, text: "1000"},
+		{input: "/attach", kind: commandAttach, text: ""},
+		{input: "/attach 7", kind: commandAttach, text: "7"},
 	}
 	for _, tc := range cases {
 		got := parseCommand(tc.input)
 		if got.kind != tc.kind || got.text != tc.text {
 			t.Fatalf("%q: got kind=%v text=%q, want kind=%v text=%q", tc.input, got.kind, got.text, tc.kind, tc.text)
 		}
+	}
+}
+
+// /undo is an alias for /rewind (issue #698): previously it fell through to
+// commandUnknown.
+func TestUndoAliasesRewind(t *testing.T) {
+	rewind, ok := resolveCommand("/rewind")
+	if !ok {
+		t.Fatal("expected /rewind to resolve")
+	}
+	alias, ok := resolveCommand("/undo")
+	if !ok || alias.kind != rewind.kind {
+		t.Fatalf("expected /undo to alias /rewind, got ok=%v command=%#v", ok, alias)
+	}
+	// End-to-end: a typed /undo dispatches to the rewind handler with args intact,
+	// for both the "latest" and numeric-<sequence> forms of the /rewind contract.
+	if parsed := parseCommand("/undo latest"); parsed.kind != commandRewind || parsed.text != "latest" {
+		t.Fatalf("parseCommand(%q) = %#v, want commandRewind with text=latest", "/undo latest", parsed)
+	}
+	if parsed := parseCommand("/undo 123"); parsed.kind != commandRewind || parsed.text != "123" {
+		t.Fatalf("parseCommand(%q) = %#v, want commandRewind with text=123", "/undo 123", parsed)
+	}
+	// Guard: without the alias it would be commandUnknown.
+	if parsed := parseCommand("/undo"); parsed.kind == commandUnknown {
+		t.Fatal("/undo resolved to commandUnknown — the alias is not wired")
 	}
 }
 

@@ -7,9 +7,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/mcp"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/execution"
+	"github.com/Twigpine/zero/internal/mcp"
+	"github.com/Twigpine/zero/internal/tools"
 )
 
 type mcpToolListItem struct {
@@ -29,7 +30,15 @@ type mcpToolListItem struct {
 // It returns a trustSkip alongside the runtime so the caller can fold the MCP gate
 // into the one-line trust notice (mirroring the hooks and plugins chokepoints);
 // otherwise a workspace whose only project config is MCP would be gated silently.
-func registerMCPToolsForWorkspace(ctx context.Context, workspaceRoot string, registry *tools.Registry, deps appDeps, autonomy mcp.PermissionAutonomy, trustRoot string) (mcpToolRuntime, trustSkip, error) {
+func registerMCPToolsForWorkspace(ctx context.Context, workspaceRoot string, registry *tools.Registry, deps appDeps, autonomy mcp.PermissionAutonomy, trustRoot string, runners ...*execution.Runner) (mcpToolRuntime, trustSkip, error) {
+	options := mcp.RegisterOptions{}
+	if len(runners) > 0 {
+		options.Execution = runners[0]
+	}
+	return registerMCPToolsForWorkspaceWithOptions(ctx, workspaceRoot, registry, deps, autonomy, trustRoot, options)
+}
+
+func registerMCPToolsForWorkspaceWithOptions(ctx context.Context, workspaceRoot string, registry *tools.Registry, deps appDeps, autonomy mcp.PermissionAutonomy, trustRoot string, options mcp.RegisterOptions) (mcpToolRuntime, trustSkip, error) {
 	excludeProject, trustCheckErrored := resolveTrust(trustRoot)
 	skip := trustSkip{
 		excludedProjectConfig: excludeProject && projectMCPConfigExists(workspaceRoot),
@@ -46,10 +55,10 @@ func registerMCPToolsForWorkspace(ctx context.Context, workspaceRoot string, reg
 	if err != nil {
 		return nil, skip, err
 	}
-	runtime, err := deps.registerMCPTools(ctx, registry, cfg, mcp.RegisterOptions{
-		PermissionStore: store,
-		Autonomy:        autonomy,
-	})
+	options.PermissionStore = store
+	options.Autonomy = autonomy
+	options.WorkspaceRoot = workspaceRoot
+	runtime, err := deps.registerMCPTools(ctx, registry, cfg, options)
 	return runtime, skip, err
 }
 

@@ -10,11 +10,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/oauth"
-	"github.com/Gitlawb/zero/internal/providerhealth"
-	"github.com/Gitlawb/zero/internal/zerocommands"
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/oauth"
+	"github.com/Twigpine/zero/internal/providerhealth"
+	"github.com/Twigpine/zero/internal/zerocommands"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 func TestRunConfigPrintsRedactedSummary(t *testing.T) {
@@ -345,6 +345,83 @@ func TestRunProvidersAddWritesCatalogProfile(t *testing.T) {
 	output := stdout.String()
 	if !strings.Contains(output, "Added provider fast") || !strings.Contains(output, configPath) {
 		t.Fatalf("unexpected add output: %q", output)
+	}
+}
+
+func TestRunProvidersAddAimlapiWritesDefaultHeaders(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	configPath := filepath.Join(t.TempDir(), "zero", "config.json")
+
+	exitCode := runWithDeps([]string{"providers", "add", "aimlapi"}, &stdout, &stderr, providerSetupDeps(configPath))
+
+	if exitCode != exitSuccess {
+		t.Fatalf("expected exit code %d, got %d: %s", exitSuccess, exitCode, stderr.String())
+	}
+	cfg := readFileConfig(t, configPath)
+	if len(cfg.Providers) != 1 {
+		t.Fatalf("providers = %#v, want one provider", cfg.Providers)
+	}
+	profile := cfg.Providers[0]
+	if profile.Name != "aimlapi" ||
+		profile.CatalogID != "aimlapi" ||
+		profile.BaseURL != "https://api.aimlapi.com/v1" ||
+		profile.Model != "anthropic/claude-sonnet-5" ||
+		profile.APIKeyEnv != "AIMLAPI_API_KEY" {
+		t.Fatalf("unexpected provider profile: %#v", profile)
+	}
+	if profile.CustomHeaders["X-AIMLAPI-Partner-ID"] != "part_62yQoGYDq4Yqnrj2R1iGrDNJ" ||
+		profile.CustomHeaders["X-AIMLAPI-Integration-Repo"] != "Gitlawb/zero" {
+		t.Fatalf("missing aimlapi.com default headers: %#v", profile.CustomHeaders)
+	}
+}
+
+func TestRunProvidersAddAimlapiMixedCaseHeaderOverride(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	configPath := filepath.Join(t.TempDir(), "zero", "config.json")
+
+	// A differently-cased override must replace the catalog header in place, not
+	// leave both spellings behind to race when request construction canonicalizes.
+	exitCode := runWithDeps([]string{
+		"providers", "add", "aimlapi",
+		"--header", "x-aimlapi-partner-id=part_override",
+	}, &stdout, &stderr, providerSetupDeps(configPath))
+
+	if exitCode != exitSuccess {
+		t.Fatalf("expected exit code %d, got %d: %s", exitSuccess, exitCode, stderr.String())
+	}
+	profile := readFileConfig(t, configPath).Providers[0]
+	if _, ok := profile.CustomHeaders["x-aimlapi-partner-id"]; ok {
+		t.Fatalf("lowercase override left a duplicate key: %#v", profile.CustomHeaders)
+	}
+	if profile.CustomHeaders["X-AIMLAPI-Partner-ID"] != "part_override" {
+		t.Fatalf("override did not win on the canonical key: %#v", profile.CustomHeaders)
+	}
+}
+
+func TestRunProvidersAddAimlapiOverrideDropsCatalogHeaders(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	configPath := filepath.Join(t.TempDir(), "zero", "config.json")
+
+	exitCode := runWithDeps([]string{
+		"providers", "add", "aimlapi",
+		"--base-url", "https://staging.example/v1",
+		"--header", "X-Environment=staging",
+	}, &stdout, &stderr, providerSetupDeps(configPath))
+	if exitCode != exitSuccess {
+		t.Fatalf("expected exit code %d, got %d: %s", exitSuccess, exitCode, stderr.String())
+	}
+	profile := readFileConfig(t, configPath).Providers[0]
+	if _, ok := profile.CustomHeaders["X-AIMLAPI-Partner-ID"]; ok {
+		t.Fatalf("partner attribution leaked to overridden endpoint: %#v", profile.CustomHeaders)
+	}
+	if _, ok := profile.CustomHeaders["X-AIMLAPI-Integration-Repo"]; ok {
+		t.Fatalf("integration attribution leaked to overridden endpoint: %#v", profile.CustomHeaders)
+	}
+	if profile.CustomHeaders["X-Environment"] != "staging" {
+		t.Fatalf("explicit user header was dropped: %#v", profile.CustomHeaders)
 	}
 }
 
@@ -803,6 +880,40 @@ func providerSetupDeps(configPath string) appDeps {
 	}
 }
 
+// providerEnvSetupDeps is providerSetupDeps plus a REAL resolver pinned to a
+// temporary user config and a fixed environment. providerSetupDeps only
+// redirects WRITES, so without this the `providers` subcommands resolve against
+// the developer's own config.json and ambient provider variables: a test that
+// exports OPENAI_API_KEY passes on a machine whose real config has an active
+// provider and fails on one that also has GEMINI_API_KEY exported (issue
+// #1130). Passing Env makes resolution fully hermetic — config.envValue prefers
+// the map over os.Getenv whenever it is non-nil.
+func providerEnvSetupDeps(t *testing.T, configPath string, env map[string]string) appDeps {
+	t.Helper()
+
+	cwd := t.TempDir()
+	deps := providerSetupDeps(configPath)
+	deps.getwd = func() (string, error) { return cwd, nil }
+	deps.resolveConfig = func(workspaceRoot string, overrides config.Overrides) (config.ResolvedConfig, error) {
+		return config.Resolve(config.ResolveOptions{
+			UserConfigPath: configPath,
+			Env:            env,
+			Overrides:      overrides,
+		})
+	}
+	// summarizeConfig reads OAuth LOGIN state through the default store, which
+	// resolves the developer's own ZERO_OAUTH_TOKENS_PATH (or XDG keyring root)
+	// — a machine with a stored ChatGPT login would make `providers list`
+	// assertions flip. Pin the file and the backend per the coding guideline
+	// that no test may read the developer's real config, cache or state dirs:
+	// forcing "file" also prevents an ambient ZERO_OAUTH_STORAGE=keyring from
+	// pulling the OS keychain into these tests.
+	tokensPath := filepath.Join(t.TempDir(), "oauth-tokens.json")
+	t.Setenv("ZERO_OAUTH_TOKENS_PATH", tokensPath)
+	t.Setenv("ZERO_OAUTH_STORAGE", "file")
+	return deps
+}
+
 func readFileConfig(t *testing.T, path string) config.FileConfig {
 	t.Helper()
 
@@ -888,5 +999,12 @@ func TestProvidersListMarksOAuthLoginProviders(t *testing.T) {
 	rendered := formatProviderSummaries("list", summary.Providers)
 	if !strings.Contains(rendered, "oauth login") {
 		t.Fatalf("list should render the oauth login state, got:\n%s", rendered)
+	}
+}
+
+func TestAtomicCatalogSetupRequiresLoadedModel(t *testing.T) {
+	out := formatProviderCatalogLine(providerCatalogSummary{ID: "atomic-chat-local", RuntimeSupported: true})
+	if strings.Contains(out, "zero providers setup atomic-chat-local --set-active") || !strings.Contains(out, "zero setup") {
+		t.Fatalf("catalog advertises a failing setup command: %s", out)
 	}
 }

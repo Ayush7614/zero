@@ -219,7 +219,63 @@ func DetectInteractiveCommand(command string, goos string) InteractiveCommandRes
 		}
 	}
 
+	// AST second opinion (issue #473): the hand-written segment split above
+	// mis-handles interactive programs hidden by unusual quoting, command
+	// substitution, subshells, or newline separators. Re-extract the real simple
+	// commands from the parsed shell tree and apply the SAME full pipeline
+	// (interactive segments, sh -c payload recursion, per-program lookup), so a
+	// bypass is caught while every program stays classified exactly as before
+	// (ssh with a trailing command, python -c, etc. remain allowed). A command
+	// the parser cannot handle (Windows cmd.exe, obfuscation) yields no commands
+	// and falls through unchanged — the guard never hard-blocks on a parse error.
+	for _, fields := range astCommandFields(command) {
+		if result, ok := inspectCommandFields(fields, goos); ok {
+			return result
+		}
+	}
+
 	return InteractiveCommandResult{}
+}
+
+// inspectCommandFields applies the full interactive-detection pipeline to one
+// already-split command's fields: the multi-word interactive segments, then the
+// `sh -c <payload>` recursion, then the per-program lookup with its
+// non-interactive suppressions (hasNonInteractiveFlag covers REPL flags and
+// trailing-command clients like ssh). It mirrors the hand-written passes above
+// so an AST-extracted command is classified identically to a plainly-split one.
+func inspectCommandFields(fields []string, goos string) (InteractiveCommandResult, bool) {
+	body := strings.ToLower(commandBody(fields))
+	for _, seg := range interactiveSegments {
+		if body == seg.match || strings.HasPrefix(body, seg.match+" ") {
+			suggestion := seg.suggestion
+			if goos == "windows" && seg.windowsSuggestion != "" {
+				suggestion = seg.windowsSuggestion
+			}
+			return InteractiveCommandResult{Interactive: true, Command: seg.command, Reason: seg.reason, Suggestion: suggestion}, true
+		}
+	}
+	first := firstProgram(fields)
+	if first == "" {
+		return InteractiveCommandResult{}, false
+	}
+	if payload := shellDashCPayload(first, fields); payload != "" {
+		if inner := DetectInteractiveCommand(payload, goos); inner.Interactive {
+			return inner, true
+		}
+		return InteractiveCommandResult{}, false
+	}
+	program, ok := interactivePrograms[first]
+	if !ok || (program.windowsOnly && goos != "windows") {
+		return InteractiveCommandResult{}, false
+	}
+	if hasNonInteractiveFlag(first, fields) {
+		return InteractiveCommandResult{}, false
+	}
+	suggestion := program.suggestion
+	if goos == "windows" && program.windowsSuggestion != "" {
+		suggestion = program.windowsSuggestion
+	}
+	return InteractiveCommandResult{Interactive: true, Command: first, Reason: program.reason, Suggestion: suggestion}, true
 }
 
 // wrapperPrograms are launcher prefixes that precede the real program. After
@@ -344,6 +400,32 @@ func isNumericToken(field string) bool {
 	return true
 }
 
+// shellCommandFlag reports whether arg is a shell option token that carries the
+// command string to run — the `-c`/`--command` flag — so callers can recurse into
+// the payload. POSIX getopt lets a shell cluster its short options, so the flag
+// is frequently grouped with other letters (`bash -ec`, `sh -lc`, `zsh -xc`);
+// a bare `-c` is only the one-letter case. A long option other than the exact
+// `--command` is not a match. `-o` and `-O` consume the remainder of their
+// cluster (or the next token) as an option value, so a `c` that follows them is
+// that value, not the command flag.
+func shellCommandFlag(arg string) bool {
+	if arg == "--command" {
+		return true
+	}
+	if len(arg) < 2 || arg[0] != '-' || arg[1] == '-' {
+		return false
+	}
+	for _, flag := range arg[1:] {
+		switch flag {
+		case 'c':
+			return true
+		case 'o', 'O':
+			return false
+		}
+	}
+	return false
+}
+
 // shellDashCPayload returns the command string passed to `sh -c`/`bash -c`
 // (and other POSIX shells) so the caller can recurse into it, or "" when the
 // segment is not a `<shell> -c <payload>` invocation. The payload is returned
@@ -360,7 +442,14 @@ func shellDashCPayload(program string, fields []string) string {
 	}
 	args := fields[start+1:]
 	for i, arg := range args {
-		if arg == "-c" || arg == "--command" {
+		// `--` ends option processing: every following token is a positional
+		// operand (a script name or argument), not a shell flag. Treating
+		// `bash -- -ec 'cmd'` as `-c` would recurse into an operand the shell
+		// never runs as a command string.
+		if arg == "--" {
+			break
+		}
+		if shellCommandFlag(arg) {
 			if i+1 < len(args) {
 				return strings.Join(args[i+1:], " ")
 			}
@@ -374,25 +463,70 @@ func shellDashCPayload(program string, fields []string) string {
 // name: it strips shell quoting/escaping characters (", ', `, \) wherever they
 // appear in the token (including embedded ones like `vi\m` or `v"i"m`), strips
 // leading command-substitution markers, removes any directory prefix (so
-// /usr/bin/vim and C:\tools\vim.exe match "vim"), and lowercases. This closes
-// path/quote/substitution evasions of the detector.
+// /usr/bin/vim and C:\tools\vim.exe match "vim"), removes Windows executable
+// suffixes, and lowercases. This closes path/quote/substitution evasions of the
+// detector and keeps curl.exe/npm.cmd equivalent to curl/npm for risk analysis.
 func normalizeProgramToken(field string) string {
 	token := strings.TrimSpace(field)
 	token = strings.TrimLeft(token, "$(")
 	token = strings.TrimRight(token, ")")
-	// Strip shell quoting/escaping characters (", ', `, \) wherever they appear
-	// in the token — surrounding, embedded, or as a mid-word escape — so
-	// "vim", v"i"m, 'v'im, and vi\m all collapse to the program name. This is
-	// done BEFORE the directory-prefix trim so an escape can't masquerade as a
-	// path separator (e.g. vi\m must become vim, not m).
-	token = stripChars(token, "\"'`\\")
-	// Strip a directory prefix so /usr/bin/vim reduces to the basename. (A
-	// Windows-style backslash path separator is already removed above, so only
-	// the POSIX separator remains to split on.)
-	if i := strings.LastIndex(token, "/"); i >= 0 {
-		token = token[i+1:]
+	// PowerShell commonly invokes drive-letter, UNC, and relative paths. Extract
+	// their basename while backslashes still carry path-separator meaning;
+	// removing them first would turn C:\tools\curl.exe into c:toolscurl.exe and
+	// bypass the canonical curl risk entry.
+	pathToken := stripChars(token, "\"'`")
+	if windowsPathBasename, ok := windowsExecutablePathBasename(pathToken); ok {
+		token = windowsPathBasename
+	} else {
+		// Strip shell quoting/escaping characters (", ', `, \) wherever they
+		// appear in the token — surrounding, embedded, or as a mid-word escape
+		// — so "vim", v"i"m, 'v'im, and vi\m all collapse to the program name.
+		token = stripChars(token, "\"'`\\")
+		// Strip a directory prefix so /usr/bin/vim reduces to the basename.
+		if i := strings.LastIndex(token, "/"); i >= 0 {
+			token = token[i+1:]
+		}
 	}
-	return strings.ToLower(token)
+	token = strings.ToLower(token)
+	for _, suffix := range []string{".exe", ".cmd", ".bat", ".com"} {
+		if strings.HasSuffix(token, suffix) {
+			return strings.TrimSuffix(token, suffix)
+		}
+	}
+	return token
+}
+
+func windowsExecutablePathBasename(token string) (string, bool) {
+	drivePath := len(token) >= 3 &&
+		((token[0] >= 'a' && token[0] <= 'z') || (token[0] >= 'A' && token[0] <= 'Z')) &&
+		token[1] == ':'
+	uncPath := strings.HasPrefix(token, `\\`)
+	explicitRelativePath := strings.HasPrefix(token, `.\`) || strings.HasPrefix(token, `..\`)
+	backslashRelativePath := strings.ContainsRune(token, '\\') && hasWindowsExecutableSuffix(token)
+	if !drivePath && !uncPath && !explicitRelativePath && !backslashRelativePath {
+		return "", false
+	}
+	index := strings.LastIndexAny(token, `\/`)
+	if index >= 0 {
+		if index+1 >= len(token) {
+			return "", false
+		}
+		return token[index+1:], true
+	}
+	if drivePath && len(token) > 2 {
+		return token[2:], true
+	}
+	return "", false
+}
+
+func hasWindowsExecutableSuffix(token string) bool {
+	token = strings.ToLower(token)
+	for _, suffix := range []string{".exe", ".cmd", ".bat", ".com"} {
+		if strings.HasSuffix(token, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // stripChars returns s with every rune in cutset removed.

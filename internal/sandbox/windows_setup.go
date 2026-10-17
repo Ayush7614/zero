@@ -15,7 +15,7 @@ import (
 
 const WindowsSandboxSetupName = "zero-windows-sandbox-setup.exe"
 
-const windowsSandboxSetupMarkerSchemaVersion = 4
+const windowsSandboxSetupMarkerSchemaVersion = 5
 
 type WindowsSandboxSetupArgsOptions struct {
 	SandboxHome       string
@@ -43,17 +43,6 @@ type WindowsSandboxSetupMarker struct {
 	NetworkInfraHash string `json:"networkInfraHash"`
 	OfflineFilterSID string `json:"offlineFilterSid"`
 	NetworkFilters   int    `json:"networkFilters"`
-}
-
-// WindowsSandboxSetupPathForRunner derives the setup helper's path from a
-// standalone command-runner path (the sibling .exe in the release layout).
-// Retained for that layout; self-dispatch callers use
-// ResolveWindowsSandboxSetupHelper instead.
-func WindowsSandboxSetupPathForRunner(runnerPath string) string {
-	if strings.TrimSpace(runnerPath) == "" {
-		return ""
-	}
-	return filepath.Join(filepath.Dir(runnerPath), WindowsSandboxSetupName)
 }
 
 func WindowsSandboxSetupMarkerPath(sandboxHome string) string {
@@ -155,6 +144,10 @@ func RunWindowsSandboxSetup(args []string, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, WindowsSandboxSetupName+": "+err.Error())
 		return 2
+	}
+	if err := windowsDenyReadRestrictedTokenUnsupportedProfile(config.PermissionProfile); err != nil {
+		fmt.Fprintln(stderr, WindowsSandboxSetupName+": "+err.Error())
+		return 1
 	}
 	return runWindowsSandboxSetup(config, stderr)
 }

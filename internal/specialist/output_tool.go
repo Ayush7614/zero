@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/background"
-	"github.com/Gitlawb/zero/internal/sessions"
-	"github.com/Gitlawb/zero/internal/streamjson"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/background"
+	"github.com/Twigpine/zero/internal/sessions"
+	"github.com/Twigpine/zero/internal/streamjson"
+	"github.com/Twigpine/zero/internal/tools"
 )
 
 const (
@@ -33,10 +33,6 @@ type outputParameters struct {
 	TaskID    string
 	Block     bool
 	TimeoutMS int
-}
-
-func NewOutputTool(manager *background.Manager) *OutputTool {
-	return &OutputTool{manager: manager}
 }
 
 func newOutputToolWithManagerFunc(managerFunc BackgroundManagerFunc, sessionStore *sessions.Store) *OutputTool {

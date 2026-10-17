@@ -2,25 +2,23 @@ package tools
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
 
-	"github.com/Gitlawb/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/execution"
+	"github.com/Twigpine/zero/internal/sandbox"
 )
 
 func TestIndependentExecCommandConstructorsShareDefaultManager(t *testing.T) {
-	root := t.TempDir()
+	root := execTestRoot(t)
 	execTool := NewScopedExecCommandTool(root, nil, nil)
 	writeTool := NewWriteStdinTool(nil)
 
@@ -78,17 +76,21 @@ func TestExecCommandToolDescribesHostShellSyntax(t *testing.T) {
 	description := strings.ToLower(strings.Join(descriptionParts, " "))
 
 	if runtime.GOOS == "windows" {
-		if !strings.Contains(description, "cmd.exe") || !strings.Contains(description, "cwd") {
-			t.Fatalf("expected Windows cmd.exe and cwd guidance in exec_command description, got %q", description)
-		}
-		if !strings.Contains(description, "double quotes") || !strings.Contains(description, `--jq ".a | b"`) {
-			t.Fatalf("expected the double-quote metacharacter rule in exec_command description, got %q", description)
+		shell := detectShellRuntime(runtime.GOOS)
+		if shell.Kind == shellKindPowerShell {
+			for _, want := range []string{"powershell", "cwd", "get-childitem", "select-string", "$env:name"} {
+				if !strings.Contains(description, want) {
+					t.Fatalf("expected Windows PowerShell guidance %q in exec_command description, got %q", want, description)
+				}
+			}
+		} else if !strings.Contains(description, "cmd.exe") || !strings.Contains(description, "cwd") {
+			t.Fatalf("expected Windows cmd.exe fallback guidance in exec_command description, got %q", description)
 		}
 	}
 }
 
 func TestExecCommandReturnsSessionAndWriteStdinPollsCompletion(t *testing.T) {
-	root := t.TempDir()
+	root := execTestRoot(t)
 	manager := newExecSessionManager()
 	execTool := NewScopedExecCommandTool(root, nil, manager)
 	writeTool := NewWriteStdinTool(manager)
@@ -102,6 +104,12 @@ func TestExecCommandReturnsSessionAndWriteStdinPollsCompletion(t *testing.T) {
 	}
 	if start.Meta["session_id"] == "" {
 		t.Fatalf("expected running session metadata, got %#v output=%q", start.Meta, start.Output)
+	}
+	if start.ExecutionOutcome == nil || start.ExecutionOutcome.State != execution.StateRetained || start.ExecutionOutcome.Kind != execution.OutcomeRunning {
+		t.Fatalf("running execution outcome = %#v, want retained/running", start.ExecutionOutcome)
+	}
+	if start.ExecutionOutcome.ProcessID != start.Meta["session_id"] {
+		t.Fatalf("process id = %q, want session id %q", start.ExecutionOutcome.ProcessID, start.Meta["session_id"])
 	}
 	if !strings.Contains(start.Output, `chars "\u0003"`) {
 		t.Fatalf("running session output should explain Ctrl-C cleanup, got %q", start.Output)
@@ -124,10 +132,13 @@ func TestExecCommandReturnsSessionAndWriteStdinPollsCompletion(t *testing.T) {
 	if poll.Meta["exit_code"] != "0" {
 		t.Fatalf("expected exit_code 0, got %#v", poll.Meta)
 	}
+	if poll.ExecutionOutcome == nil || poll.ExecutionOutcome.State != execution.StateCompleted || poll.ExecutionOutcome.Kind != execution.OutcomeSuccess {
+		t.Fatalf("completed execution outcome = %#v, want completed/success", poll.ExecutionOutcome)
+	}
 }
 
 func TestExecCommandRequireEscalatedBypassesNativeSandboxAfterApproval(t *testing.T) {
-	root := t.TempDir()
+	root := execTestRoot(t)
 	manager := newExecSessionManager()
 	registry := NewRegistry()
 	registry.Register(NewScopedExecCommandTool(root, nil, manager))
@@ -158,6 +169,12 @@ func TestExecCommandRequireEscalatedBypassesNativeSandboxAfterApproval(t *testin
 	if result.Meta["sandbox_wrapped"] == "true" {
 		t.Fatalf("require_escalated exec_command must not be wrapped; meta=%#v", result.Meta)
 	}
+	if result.ExecutionRequest == nil || !executionRequestHasCapability(*result.ExecutionRequest, execution.CapabilityUnrestricted, "host") {
+		t.Fatalf("escalated execution request must record unrestricted host capability: %#v", result.ExecutionRequest)
+	}
+	if !executionRequestHasCapability(*result.ExecutionRequest, execution.CapabilityExternalNetwork, "") {
+		t.Fatalf("escalated execution request must record external network capability: %#v", result.ExecutionRequest)
+	}
 }
 
 // TestExecCommandRequireEscalatedBypassesMsysGuardAfterApproval mirrors
@@ -170,7 +187,7 @@ func TestExecCommandRequireEscalatedBypassesMsysGuardAfterApproval(t *testing.T)
 	if runtime.GOOS != "windows" {
 		t.Skip("windows-only MSYS sandbox guard")
 	}
-	root := t.TempDir()
+	root := execTestRoot(t)
 	manager := newExecSessionManager()
 	registry := NewRegistry()
 	registry.Register(NewScopedExecCommandTool(root, nil, manager))
@@ -179,9 +196,15 @@ func TestExecCommandRequireEscalatedBypassesMsysGuardAfterApproval(t *testing.T)
 		Policy:        sandbox.DefaultPolicy(),
 		Backend:       sandbox.Backend{Name: sandbox.BackendUnavailable, Message: "native sandbox unavailable"},
 	})
+	msysCommand := "cat somefile.txt"
+	if detectShellRuntime(runtime.GOOS).Kind == shellKindPowerShell {
+		// cat is a native Get-Content alias in PowerShell, so use an executable
+		// name that still exercises the MSYS guard.
+		msysCommand = "grep pattern somefile.txt"
+	}
 
 	result := registry.RunWithOptions(context.Background(), ExecCommandToolName, map[string]any{
-		"cmd":                 "cat somefile.txt",
+		"cmd":                 msysCommand,
 		"sandbox_permissions": string(SandboxPermissionsRequireEscalated),
 	}, RunOptions{
 		PermissionGranted: true,
@@ -191,8 +214,8 @@ func TestExecCommandRequireEscalatedBypassesMsysGuardAfterApproval(t *testing.T)
 
 	// Assert on the preflight block sentinel (exit_code "-1", set only by
 	// shellIssueBlockResult) rather than shell_issue: once the guard is
-	// bypassed, "cat somefile.txt" actually runs, and its real,
-	// PATH-dependent output could otherwise trip the unrelated
+	// bypassed, the command actually runs, and its real, PATH-dependent output
+	// could otherwise trip the unrelated
 	// post-execution detectShellOutputIssue heuristic and make this
 	// assertion flaky for reasons unrelated to the guard under test.
 	if result.Meta["exit_code"] == "-1" {
@@ -201,7 +224,7 @@ func TestExecCommandRequireEscalatedBypassesMsysGuardAfterApproval(t *testing.T)
 }
 
 func TestExecCommandReturnsExitCodeWhenCommandCompletesDuringInitialYield(t *testing.T) {
-	root := t.TempDir()
+	root := execTestRoot(t)
 	manager := newExecSessionManager()
 	execTool := NewScopedExecCommandTool(root, nil, manager)
 
@@ -218,13 +241,123 @@ func TestExecCommandReturnsExitCodeWhenCommandCompletesDuringInitialYield(t *tes
 	if result.Meta["exit_code"] != "0" {
 		t.Fatalf("exit_code = %#v, want 0", result.Meta)
 	}
-	if manager.len() != 0 {
-		t.Fatalf("completed command should be removed immediately, manager has %d sessions", manager.len())
+	if manager.Len() != 0 {
+		t.Fatalf("completed command should be removed immediately, manager has %d sessions", manager.Len())
+	}
+	if result.ExecutionOutcome == nil || result.ExecutionOutcome.State != execution.StateCompleted || result.ExecutionOutcome.Kind != execution.OutcomeSuccess {
+		t.Fatalf("execution outcome = %#v, want completed/success", result.ExecutionOutcome)
 	}
 }
 
+func TestExecCommandClampsOversizedYieldInsteadOfRejecting(t *testing.T) {
+	result := NewScopedExecCommandTool(t.TempDir(), nil, newExecSessionManager()).Run(context.Background(), map[string]any{
+		"cmd":           helperCommand("success"),
+		"yield_time_ms": 120000,
+	})
+	if result.Status != StatusOK || result.Meta["exit_code"] != "0" {
+		t.Fatalf("oversized yield should be clamped, got status=%s meta=%#v output=%q", result.Status, result.Meta, result.Output)
+	}
+}
+
+func TestExecCommandReportsWorkspaceChanges(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell syntax")
+	}
+	root := execTestRoot(t)
+	result := NewScopedExecCommandTool(root, nil, newExecSessionManager()).Run(context.Background(), map[string]any{
+		"cmd":           "mkdir -p src node_modules/pkg && printf 'export {}' > src/main.ts && printf generated > node_modules/pkg/index.js",
+		"yield_time_ms": 30000,
+	})
+	if result.Status != StatusOK {
+		t.Fatalf("exec_command status = %s: %s", result.Status, result.Output)
+	}
+	if len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "src/main.ts" {
+		t.Fatalf("ChangedFiles = %#v, want source file without generated tree", result.ChangedFiles)
+	}
+	if result.ExecutionOutcome == nil || len(result.ExecutionOutcome.Changes) != 2 {
+		t.Fatalf("typed changes = %#v, want source file and bounded generated-tree summary", result.ExecutionOutcome)
+	}
+	if len(result.ChangeSummaries) != 1 || result.ChangeSummaries[0].Path != "node_modules/" || !result.ChangeSummaries[0].Aggregated {
+		t.Fatalf("ChangeSummaries = %#v, want node_modules aggregate", result.ChangeSummaries)
+	}
+}
+
+func TestExecCommandApplicationFailureHasTypedOutcome(t *testing.T) {
+	result := NewScopedExecCommandTool(t.TempDir(), nil, newExecSessionManager()).Run(context.Background(), map[string]any{
+		"cmd":           helperCommand("fail"),
+		"yield_time_ms": 30000,
+	})
+
+	if result.Status != StatusError {
+		t.Fatalf("status = %s, want error", result.Status)
+	}
+	if result.ExecutionOutcome == nil || result.ExecutionOutcome.State != execution.StateFailed || result.ExecutionOutcome.Kind != execution.OutcomeApplicationFailure {
+		t.Fatalf("execution outcome = %#v, want failed/application_failure", result.ExecutionOutcome)
+	}
+	wantExitCode := helperFailureExitCode()
+	if result.ExecutionOutcome.Exit == nil || result.ExecutionOutcome.Exit.Code != wantExitCode {
+		t.Fatalf("execution exit = %#v, want code %d", result.ExecutionOutcome.Exit, wantExitCode)
+	}
+}
+
+func TestExecCommandUsesStructuredAdapterDenial(t *testing.T) {
+	scope := filepath.Join(t.TempDir(), ".zero")
+	result := execToolResult(execToolResultInput{
+		commandText: "mkdir .zero",
+		exited:      true,
+		exitCode:    1,
+		enforcement: execution.Enforcement{Backend: string(sandbox.BackendLinuxBwrap), Level: string(sandbox.EnforcementNative)},
+		report: execution.AdapterReport{Denial: &execution.Denial{
+			Capability:  execution.Capability{Kind: execution.CapabilityProtectedMetadata, Scope: scope},
+			Source:      execution.DenialSourceConfiguredPolicy,
+			Reason:      "protected workspace metadata cannot be created",
+			Recoverable: true,
+			NextAction:  execution.DenialNextActionRequestApproval,
+		}},
+	})
+
+	if result.ExecutionOutcome == nil || result.ExecutionOutcome.State != execution.StateDenied || result.ExecutionOutcome.Kind != execution.OutcomeEnforcementDenied {
+		t.Fatalf("execution outcome = %#v, want denied/enforcement_denied", result.ExecutionOutcome)
+	}
+	if result.ExecutionOutcome.Denial == nil || result.ExecutionOutcome.Denial.Capability.Scope != scope {
+		t.Fatalf("structured denial = %#v, want exact scope %q", result.ExecutionOutcome.Denial, scope)
+	}
+	if result.Meta["sandbox_denial_capability"] != string(execution.CapabilityProtectedMetadata) || result.Meta["sandbox_denial_scope"] != scope {
+		t.Fatalf("compatibility metadata lost structured denial: %#v", result.Meta)
+	}
+}
+
+func TestExecCommandDoesNotInferNativeSandboxDenialFromOutput(t *testing.T) {
+	result := execToolResult(execToolResultInput{
+		commandText: "touch \"$HOME/probe\"",
+		output:      "touch: cannot touch '/home/user/probe': Read-only file system",
+		exited:      true,
+		exitCode:    1,
+		enforcement: execution.Enforcement{Backend: string(sandbox.BackendLinuxBwrap), Level: string(sandbox.EnforcementNative)},
+	})
+
+	if result.ExecutionOutcome == nil || result.ExecutionOutcome.State != execution.StateFailed || result.ExecutionOutcome.Kind != execution.OutcomeApplicationFailure {
+		t.Fatalf("execution outcome = %#v, want failed/application_failure", result.ExecutionOutcome)
+	}
+	if result.ExecutionOutcome.Denial != nil {
+		t.Fatalf("command output created a typed denial: %#v", result.ExecutionOutcome.Denial)
+	}
+	if result.Meta[SandboxLikelyDeniedMeta] == "true" {
+		t.Fatalf("command output created sandbox-denial metadata: %#v", result.Meta)
+	}
+}
+
+func executionRequestHasCapability(request execution.Request, kind execution.CapabilityKind, scope string) bool {
+	for _, capability := range request.Capabilities {
+		if capability.Kind == kind && (scope == "" || capability.Scope == scope) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestExecCommandForegroundServerReturnsSessionAndServesHTTP(t *testing.T) {
-	root := t.TempDir()
+	root := execTestRoot(t)
 	manager := newExecSessionManager()
 	execTool := NewScopedExecCommandTool(root, nil, manager)
 	writeTool := NewWriteStdinTool(manager)
@@ -240,20 +373,34 @@ func TestExecCommandForegroundServerReturnsSessionAndServesHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("foreground server should return session_id, meta=%#v output=%q", start.Meta, start.Output)
 	}
-	addr := parseListeningAddress(start.Output)
-	if addr == "" {
-		t.Fatalf("server output did not include listening address: %q", start.Output)
-	}
 	t.Cleanup(func() {
 		writeTool.Run(context.Background(), map[string]any{
 			"session_id": sessionID,
 			"chars":      "\u0003",
 		})
 	})
+	// Process start-up and net.Listen can outlast the first yield on a loaded
+	// runner, so keep polling the session until the address shows up.
+	output := start.Output
+	addr := parseListeningAddress(output)
+	for deadline := time.Now().Add(20 * time.Second); addr == "" && time.Now().Before(deadline); {
+		poll := writeTool.Run(context.Background(), map[string]any{
+			"session_id":    sessionID,
+			"yield_time_ms": 250,
+		})
+		if poll.Status != StatusOK {
+			t.Fatalf("write_stdin poll status = %s: %s", poll.Status, poll.Output)
+		}
+		output += "\n" + poll.Output
+		addr = parseListeningAddress(output)
+	}
+	if addr == "" {
+		t.Fatalf("server output did not include listening address: %q", output)
+	}
 
 	response, err := http.Get("http://" + addr)
 	if err != nil {
-		t.Fatalf("foreground exec server was not reachable at %s: %v; output=%q", addr, err, start.Output)
+		t.Fatalf("foreground exec server was not reachable at %s: %v; output=%q", addr, err, output)
 	}
 	defer response.Body.Close()
 	bytes, err := io.ReadAll(response.Body)
@@ -278,9 +425,8 @@ func parseListeningAddress(output string) string {
 }
 
 func TestExecCommandReapsFinishedUnpolledSession(t *testing.T) {
-	root := t.TempDir()
-	manager := newExecSessionManager()
-	manager.completedRetention = 10 * time.Millisecond
+	root := execTestRoot(t)
+	manager := execution.NewProcessManager(execution.ProcessManagerOptions{CompletedRetention: 10 * time.Millisecond})
 	execTool := NewScopedExecCommandTool(root, nil, manager)
 
 	start := execTool.Run(context.Background(), map[string]any{
@@ -297,223 +443,16 @@ func TestExecCommandReapsFinishedUnpolledSession(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, ok := manager.get(sessionID); !ok {
+		if _, ok := manager.Snapshot(sessionID); !ok {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("session %d was not reaped; manager has %d sessions", sessionID, manager.len())
+			t.Fatalf("session %d was not reaped; manager has %d sessions", sessionID, manager.Len())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func TestStopAllWaitsForSessionsToExit(t *testing.T) {
-	manager := newExecSessionManager()
-	release := make(chan struct{})
-	returned := make(chan struct{})
-	cancelled := make(chan struct{})
-	session := &execSession{
-		id:     1000,
-		output: newExecOutputBuffer(),
-		done:   make(chan struct{}),
-	}
-	session.cancel = func() {
-		close(cancelled)
-		go func() {
-			<-release
-			session.markDone(nil, -1)
-		}()
-	}
-	manager.sessions[session.id] = session
-
-	go func() {
-		manager.stopAll()
-		close(returned)
-	}()
-
-	select {
-	case <-cancelled:
-	case <-time.After(time.Second):
-		t.Fatal("stopAll did not terminate the session")
-	}
-	select {
-	case <-returned:
-		t.Fatal("stopAll returned before session.done closed")
-	default:
-	}
-	close(release)
-	select {
-	case <-returned:
-	case <-time.After(time.Second):
-		t.Fatal("stopAll did not return after session.done closed")
-	}
-}
-
-func TestStoreEvictsLiveSessionWithExplanation(t *testing.T) {
-	manager := newExecSessionManager()
-	manager.maxSessions = 9
-	evicted := &execSession{
-		id:         1000,
-		startedAt:  time.Unix(1000, 0),
-		lastUsedAt: time.Unix(1000, 0),
-		output:     newExecOutputBuffer(),
-		done:       make(chan struct{}),
-	}
-	evictedDone := make(chan struct{})
-	evicted.cancel = func() { close(evictedDone) }
-	manager.sessions[evicted.id] = evicted
-	for id := 1001; id <= 1008; id++ {
-		manager.sessions[id] = &execSession{
-			id:         id,
-			startedAt:  time.Unix(int64(id), 0),
-			lastUsedAt: time.Unix(int64(id), 0),
-			output:     newExecOutputBuffer(),
-			done:       make(chan struct{}),
-		}
-	}
-
-	manager.store(&execSession{
-		id:         1009,
-		startedAt:  time.Unix(1009, 0),
-		lastUsedAt: time.Unix(1009, 0),
-		output:     newExecOutputBuffer(),
-		done:       make(chan struct{}),
-	})
-
-	select {
-	case <-evictedDone:
-	case <-time.After(time.Second):
-		t.Fatal("live pruned session was not terminated")
-	}
-	if got := evicted.output.recentString(); !strings.Contains(got, "session evicted") {
-		t.Fatalf("evicted session output = %q, want explanation", got)
-	}
-	if _, ok := manager.get(evicted.id); !ok {
-		t.Fatal("evicted live session should remain visible until its reaper removes it")
-	}
-}
-
-func TestStartExecProcessFallsBackAfterPTYStartMutation(t *testing.T) {
-	original := startPTYProcessFunc
-	t.Cleanup(func() { startPTYProcessFunc = original })
-	startPTYProcessFunc = func(command *exec.Cmd, _ *execOutputBuffer) (io.WriteCloser, func(), error) {
-		command.SysProcAttr = &syscall.SysProcAttr{}
-		command.Cancel = func() error { return nil }
-		command.WaitDelay = time.Second
-		return nil, nil, errors.New("pty start failed")
-	}
-
-	command := exec.CommandContext(context.Background(), os.Args[0], "--zero-bash-helper", "success")
-	output := newExecOutputBuffer()
-	stdin, tty, cleanup, err := startExecProcess(command, output, true)
-	if err != nil {
-		t.Fatalf("startExecProcess fallback failed: %v", err)
-	}
-	if tty {
-		t.Fatal("fallback process must report tty=false")
-	}
-	_ = stdin.Close()
-	if err := command.Wait(); err != nil {
-		t.Fatalf("fallback command wait failed: %v", err)
-	}
-	cleanup()
-	if got := output.drainString(); !strings.Contains(got, "hello from bash") {
-		t.Fatalf("fallback output = %q", got)
-	}
-}
-
-func TestStartExecProcessPTYFallbackPreservesSysProcAttr(t *testing.T) {
-	original := startPTYProcessFunc
-	t.Cleanup(func() { startPTYProcessFunc = original })
-	startPTYProcessFunc = func(command *exec.Cmd, _ *execOutputBuffer) (io.WriteCloser, func(), error) {
-		return nil, nil, errors.New("pty start failed")
-	}
-
-	command := exec.CommandContext(context.Background(), os.Args[0], "--zero-bash-helper", "success")
-	customAttr := &syscall.SysProcAttr{}
-	command.SysProcAttr = customAttr
-
-	output := newExecOutputBuffer()
-	stdin, tty, cleanup, err := startExecProcess(command, output, true)
-	if err != nil {
-		t.Fatalf("startExecProcess fallback failed: %v", err)
-	}
-	if tty {
-		t.Fatal("fallback process must report tty=false")
-	}
-	_ = stdin.Close()
-	_ = command.Wait()
-	cleanup()
-
-	if command.SysProcAttr != customAttr {
-		t.Fatalf("SysProcAttr was not preserved: got %+v, want %+v", command.SysProcAttr, customAttr)
-	}
-}
-
-// TestExecOutputBufferCapsUndrainedData: a session nobody polls must not grow
-// its undrained buffer without bound — a long-lived background process that
-// keeps writing while unpolled previously ran a session's memory into the
-// tens of gigabytes and got the whole zero process OOM-killed by the OS.
-func TestExecOutputBufferCapsUndrainedData(t *testing.T) {
-	buffer := newExecOutputBuffer()
-
-	chunk := strings.Repeat("x", 1024)
-	writes := (maxExecOutputBufferBytes / len(chunk)) + 10 // comfortably over the cap
-	for i := 0; i < writes; i++ {
-		if _, err := buffer.Write([]byte(chunk)); err != nil {
-			t.Fatalf("Write: %v", err)
-		}
-	}
-
-	buffer.mu.Lock()
-	dataLen := len(buffer.data)
-	buffer.mu.Unlock()
-	if dataLen > maxExecOutputBufferBytes {
-		t.Fatalf("undrained buffer grew to %d bytes, want <= %d", dataLen, maxExecOutputBufferBytes)
-	}
-
-	out := buffer.drainString()
-	// drainString itself carries no truncation marker: a marker embedded in
-	// the drained text would always sit ~maxExecOutputBufferBytes before the
-	// end of the string, past any realistic head/tail truncation window a
-	// caller applies afterward (see execToolResult), so it's reliably lost.
-	// The signal lives out of band on consumeTruncated/peekTruncated instead.
-	if !strings.HasSuffix(out, chunk) {
-		t.Fatal("drained output should keep the most recent bytes, not the oldest")
-	}
-	if len(out) > maxExecOutputBufferBytes {
-		t.Fatalf("drained output = %d bytes, want <= %d (no marker text mixed in)", len(out), maxExecOutputBufferBytes)
-	}
-
-	if !buffer.peekTruncated() {
-		t.Fatal("peekTruncated should report the overflow without clearing it")
-	}
-	if !buffer.peekTruncated() {
-		t.Fatal("a second peekTruncated call should still report it — peek must not consume")
-	}
-	if !buffer.consumeTruncated() {
-		t.Fatal("consumeTruncated should report the overflow")
-	}
-	if buffer.consumeTruncated() {
-		t.Fatal("consumeTruncated should reset after being read once")
-	}
-	if buffer.peekTruncated() {
-		t.Fatal("peekTruncated should reflect the reset state after consumeTruncated")
-	}
-
-	// A second drain with no intervening writes must be empty.
-	if got := buffer.drainString(); got != "" {
-		t.Fatalf("drainString after a full drain = %q, want empty", got)
-	}
-}
-
-// TestExecToolResultSurfacesBufferTruncationOutsideByteBudget: an earlier
-// version embedded the truncation notice directly in the drained text, which
-// a review found sits ~maxExecOutputBufferBytes before the end of the
-// string — far past the head/tail window truncateExecOutput keeps even at
-// the tool's smallest allowed max_output_tokens, so the notice was reliably
-// swallowed or chopped. The notice must survive regardless of how small the
-// byte budget is, and it must not count against that budget.
 func TestExecToolResultSurfacesBufferTruncationOutsideByteBudget(t *testing.T) {
 	hugeOutput := strings.Repeat("y", maxExecOutputBufferBytes+1024)
 
@@ -547,61 +486,6 @@ func TestExecToolResultSurfacesBufferTruncationOutsideByteBudget(t *testing.T) {
 // Go's scheduler in practice — the reader still won the race often enough —
 // so this test doesn't prove the old code could hang; it just pins down the
 // intended behavior (bounded by wait) going forward.
-func TestCollectRespectsDeadlineUnderContinuousOutput(t *testing.T) {
-	session := &execSession{
-		id:     1000,
-		output: newExecOutputBuffer(),
-		done:   make(chan struct{}),
-	}
-
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	// Several concurrent writers, each pushing a decent-sized chunk in a tight
-	// loop: a single slow writer lets the reader win the race often enough
-	// (the runtime schedules a gap between writes) to mask the bug. Enough
-	// parallel writers keep the buffer non-empty essentially continuously,
-	// closer to a real chatty process whose PTY reads land in bursts.
-	const writers = 8
-	chunk := []byte(strings.Repeat("x", 256))
-	wg.Add(writers)
-	for i := 0; i < writers; i++ {
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					session.output.Write(chunk)
-				}
-			}
-		}()
-	}
-	t.Cleanup(func() {
-		close(stop)
-		wg.Wait()
-	})
-
-	const wait = 200 * time.Millisecond
-	start := time.Now()
-	_, _ = session.collect(context.Background(), wait)
-	elapsed := time.Since(start)
-
-	// Generous slack over `wait` for scheduling jitter under a continuously
-	// writing goroutine (worse on Windows CI under load). This must stay a
-	// small multiple of wait, not "however long the writer keeps going"
-	// (which is what the bug produced: this test would hang past the 30s
-	// test timeout without the fix).
-	if elapsed > 5*wait {
-		t.Fatalf("collect took %v under continuous output, want close to the %v deadline", elapsed, wait)
-	}
-}
-
-// resilientTempDir is like t.TempDir() but tolerates the Windows handle-release
-// lag: a SIGKILL'd child process that had the dir as its cwd may not have
-// released it the instant it is reaped, so the immediate RemoveAll t.TempDir()
-// does on cleanup can fail with "being used by another process". Retry the
-// removal briefly before giving up.
 func resilientTempDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "zero-exec-interrupt-")
@@ -642,14 +526,6 @@ func TestWriteStdinInterruptTerminatesSession(t *testing.T) {
 		t.Fatalf("session_id is not numeric: %v", err)
 	}
 
-	// Capture the live session BEFORE the interrupt so we can wait on its done
-	// channel afterwards (write_stdin removes a finished session from the
-	// manager, so manager.get would miss it post-interrupt).
-	session, ok := manager.get(sessionID)
-	if !ok {
-		t.Fatalf("session %d not found after start", sessionID)
-	}
-
 	// The operation under test: write_stdin "\x03" must itself terminate the
 	// session (exec_command.go's Ctrl-C branch). This is what the regression
 	// guards — terminating the session here directly would let the test pass even
@@ -657,19 +533,8 @@ func TestWriteStdinInterruptTerminatesSession(t *testing.T) {
 	interrupted := writeTool.Run(context.Background(), map[string]any{
 		"session_id":    sessionID,
 		"chars":         "\x03",
-		"yield_time_ms": 1000,
+		"yield_time_ms": 30000,
 	})
-
-	// De-flake: wait deterministically for the process to be reaped rather than
-	// relying on the 1000ms yield window being long enough for the async
-	// SIGKILL + reap to land (which flaked on slow CI, notably Windows smoke). A
-	// generous safety timeout fails loudly if the kill genuinely hangs; the
-	// common case returns the instant the process exits.
-	select {
-	case <-session.done:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("interrupted session %d was not reaped within 30s", sessionID)
-	}
 
 	if interrupted.Status != StatusOK {
 		t.Fatalf("interrupted session status = %s: %s", interrupted.Status, interrupted.Output)
@@ -686,7 +551,7 @@ func TestWriteStdinInterruptTerminatesSession(t *testing.T) {
 }
 
 func TestWriteStdinRejectsInputForNonTTYSession(t *testing.T) {
-	root := t.TempDir()
+	root := execTestRoot(t)
 	manager := newExecSessionManager()
 	execTool := NewScopedExecCommandTool(root, nil, manager)
 	writeTool := NewWriteStdinTool(manager)
@@ -714,12 +579,46 @@ func TestWriteStdinRejectsInputForNonTTYSession(t *testing.T) {
 	if !strings.Contains(result.Output, "does not accept stdin") {
 		t.Fatalf("unexpected output: %q", result.Output)
 	}
-	manager.stop(sessionID)
+	manager.Stop(sessionID)
+}
+
+// execTestRoot is t.TempDir with a cleanup that tolerates Windows still holding
+// the directory.
+//
+// A terminated process does not release its handles the instant the session
+// reports it exited, and Windows refuses to remove a directory with an open
+// handle where POSIX does not. t.TempDir's own cleanup removes once and fails
+// the test on a sharing violation, which turns ordinary teardown timing into a
+// test failure with nothing actually wrong underneath it.
+func execTestRoot(t *testing.T) string {
+	t.Helper()
+
+	root, err := os.MkdirTemp("", "zero-exec-test-")
+	if err != nil {
+		t.Fatalf("create test root: %v", err)
+	}
+	t.Cleanup(func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if err := os.RemoveAll(root); err == nil {
+				return
+			}
+			if time.Now().After(deadline) {
+				// Deliberately not a failure. The directory is under the OS temp
+				// root and the process holding it has already been terminated, so
+				// the worst case is a stale directory, not a broken test.
+				t.Logf("test root %s still held after the cleanup deadline; leaving it", root)
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+	return root
 }
 
 func TestWriteStdinStopIntentTerminatesNonTTYSession(t *testing.T) {
 	for _, chars := range []string{`\u0003`, "exit\n"} {
-		root := t.TempDir()
+		root := execTestRoot(t)
 		manager := newExecSessionManager()
 		execTool := NewScopedExecCommandTool(root, nil, manager)
 		writeTool := NewWriteStdinTool(manager)
@@ -736,22 +635,63 @@ func TestWriteStdinStopIntentTerminatesNonTTYSession(t *testing.T) {
 			t.Fatalf("session_id is not numeric: %v", err)
 		}
 
-		result := writeTool.Run(context.Background(), map[string]any{
-			"session_id":    sessionID,
-			"chars":         chars,
-			"yield_time_ms": 1000,
-		})
-		if result.Status != StatusOK {
-			t.Fatalf("stop input %q status = %s: %s", chars, result.Status, result.Output)
-		}
-		if result.Meta["session_id"] != "" {
-			t.Fatalf("stop input %q should not leave session running, meta=%#v output=%q", chars, result.Meta, result.Output)
+		// Re-send the stop until the session reports it has exited, rather than
+		// waiting a fixed slice and asserting on whatever is true by then.
+		//
+		// A single 1s yield used to be enough because the session ran under
+		// cmd.exe. Under PowerShell the tree is slower to stand up and tear down,
+		// and the FIRST stop in a fresh process pays the interpreter's cold start,
+		// so it routinely returns with termination already under way but not
+		// finished. The old assertion read that as "the stop did not work" and
+		// failed, intermittently, on whichever of the two inputs happened to run
+		// first. CI never saw it because the runners have PowerShell 7 while a
+		// stock Windows box only has 5.1.
+		//
+		// Repeating the same input rather than polling with empty chars is
+		// deliberate: Terminate is a no-op against an already-dead tree, so it is
+		// safe to repeat, and it keeps the interrupt flag that an empty-chars poll
+		// would drop, which is what the interrupted assertion below needs.
+		var result Result
+		// Every poll's output is kept, not just the last one. Each Continue
+		// returns only what the session produced since the previous collection,
+		// so a marker printed just before the poll that observes the exit lands
+		// in the earlier result and would be invisible to a check against the
+		// final one alone.
+		var collected strings.Builder
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			result = writeTool.Run(context.Background(), map[string]any{
+				"session_id":    sessionID,
+				"chars":         chars,
+				"yield_time_ms": 500,
+			})
+			collected.WriteString(result.Output)
+			if result.Status != StatusOK {
+				t.Fatalf("stop input %q status = %s: %s", chars, result.Status, result.Output)
+			}
+			if result.Meta["session_id"] == "" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("stop input %q left the session running past the deadline, meta=%#v output=%q", chars, result.Meta, result.Output)
+			}
 		}
 		if result.Meta["exit_code"] == "" {
 			t.Fatalf("stop input %q should report exit_code, meta=%#v output=%q", chars, result.Meta, result.Output)
 		}
 		if result.Meta["interrupted"] != "true" {
 			t.Fatalf("stop input %q should report interrupted metadata, meta=%#v output=%q", chars, result.Meta, result.Output)
+		}
+		// The session has to have been killed rather than allowed to finish.
+		// Without this the retry loop makes the test unfalsifiable: the helper
+		// sleeps 5s, well inside the deadline, so a terminate that did nothing at
+		// all would let the sleep end on its own and every assertion above would
+		// still hold. The interrupted flag does not close the hole either, since
+		// it echoes the request rather than the outcome. The helper prints this
+		// line only on the way out of a completed sleep, so its absence is what
+		// separates the two, and it says nothing about how long the loop took.
+		if strings.Contains(collected.String(), "long sleep finished") {
+			t.Fatalf("stop input %q let the session run to completion instead of terminating it, output=%q", chars, collected.String())
 		}
 	}
 }
@@ -792,7 +732,7 @@ func TestExecCommandTTYSessionAcceptsInputOnLinux(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("pty transport is currently implemented for linux")
 	}
-	root := t.TempDir()
+	root := execTestRoot(t)
 	manager := newExecSessionManager()
 	execTool := NewScopedExecCommandTool(root, nil, manager)
 	writeTool := NewWriteStdinTool(manager)
@@ -830,7 +770,7 @@ func TestExecCommandTTYSessionAcceptsInputOnLinux(t *testing.T) {
 }
 
 func TestExecSessionSnapshotsAndStopAll(t *testing.T) {
-	root := t.TempDir()
+	root := execTestRoot(t)
 	manager := newExecSessionManager()
 	execTool := NewScopedExecCommandTool(root, nil, manager).(execCommandTool)
 
@@ -881,7 +821,7 @@ func TestRegistryHonorsWriteStdinArgumentPermission(t *testing.T) {
 	registry.Register(NewWriteStdinTool(newExecSessionManager()))
 
 	poll := registry.Run(context.Background(), WriteStdinToolName, map[string]any{"session_id": 9999})
-	if poll.Status != StatusError || !strings.Contains(poll.Output, "Unknown exec session_id") {
+	if poll.Status != StatusError || !strings.Contains(poll.Output, "still-running exec_command") {
 		t.Fatalf("empty poll should reach tool without permission prompt, got status=%s output=%q", poll.Status, poll.Output)
 	}
 
@@ -901,24 +841,57 @@ func TestWriteStdinReportsUnknownSession(t *testing.T) {
 	if result.Status != StatusError {
 		t.Fatalf("status = %s, want error", result.Status)
 	}
-	if !strings.Contains(result.Output, "Unknown exec session_id 1234") {
-		t.Fatalf("unexpected output: %q", result.Output)
+	// The message must lead with recovery guidance and still identify the id.
+	if !strings.Contains(result.Output, "still-running exec_command") {
+		t.Fatalf("unknown-session error must carry recovery guidance, got: %q", result.Output)
+	}
+	if !strings.Contains(result.Output, "1234") {
+		t.Fatalf("unknown-session error must name the offending id, got: %q", result.Output)
 	}
 }
 
+// The runtime rejects session_id < 1 (intArg min 1); the advertised schema must
+// say the same so a model sees the constraint before it probes id 0.
+func TestWriteStdinSchemaPinsSessionIDMinimum(t *testing.T) {
+	schema := NewWriteStdinTool(nil).(writeStdinTool).parameters
+	prop, ok := schema.Properties["session_id"]
+	if !ok {
+		t.Fatal("session_id property missing from write_stdin schema")
+	}
+	if prop.Minimum == nil || *prop.Minimum != 1 {
+		t.Fatalf("session_id schema Minimum = %v, want 1 to match the runtime floor", prop.Minimum)
+	}
+}
+
+// A missing, zero, negative, or non-integer session_id all mean the model has no
+// live session, so write_stdin returns the SAME recovery guidance the no-live-
+// session case uses (start a session with exec_command, or edit files directly),
+// not a terse "session_id must be at least 1" that gives no way forward and names
+// a minimum that nudges the model to probe ids 1, 2, 3... Sharing one id-invariant
+// message also keeps a single repeated-failure signature, so any mix of these
+// mistakes accumulates toward the halt instead of resetting the streak (#749).
 func TestWriteStdinRequiresPositiveSessionID(t *testing.T) {
 	tool := NewWriteStdinTool(newExecSessionManager())
-	for _, args := range []map[string]any{
-		{},
-		{"session_id": 0},
+	want := UnknownExecSessionError(0)
+	for name, args := range map[string]map[string]any{
+		"missing":     {},
+		"nil":         {"session_id": nil},
+		"zero":        {"session_id": 0},
+		"negative":    {"session_id": -3},
+		"non-integer": {"session_id": "abc"},
 	} {
-		result := tool.Run(context.Background(), args)
-		if result.Status != StatusError {
-			t.Fatalf("Run(%#v) status = %s, want error", args, result.Status)
-		}
-		if !strings.Contains(result.Output, "Invalid arguments for write_stdin") {
-			t.Fatalf("Run(%#v) output = %q, want invalid arguments", args, result.Output)
-		}
+		t.Run(name, func(t *testing.T) {
+			result := tool.Run(context.Background(), args)
+			if result.Status != StatusError {
+				t.Fatalf("status = %s, want error", result.Status)
+			}
+			if result.Output != want {
+				t.Fatalf("output = %q,\n want the recovery message %q", result.Output, want)
+			}
+			if strings.Contains(result.Output, "must be at least 1") {
+				t.Fatalf("still returns the terse minimum error: %q", result.Output)
+			}
+		})
 	}
 }
 
@@ -936,38 +909,55 @@ func TestTruncateExecOutputPreservesUTF8(t *testing.T) {
 	}
 }
 
-func TestExecSessionPruneDoesNotRaceTouch(t *testing.T) {
-	// AUDIT-L15: the prune comparator read execSession.lastUsedAt under manager.mu
-	// while touch() writes it under session.mu — a data race on a time.Time. Drive
-	// both concurrently under -race; with the snapshot-under-session.mu fix it is
-	// clean, without it the race detector flags lastUsedAt.
-	mgr := newExecSessionManager()
-	for i := 0; i < 12; i++ {
-		s := &execSession{id: 1000 + i, lastUsedAt: time.Now(), done: make(chan struct{})}
-		mgr.sessions[s.id] = s
+func TestFormatExecCommandOutputTTYAttachHint(t *testing.T) {
+	running := formatExecCommandOutput("", 1007, false, 0, false, true)
+	if !strings.Contains(running, "/attach 1007 reopens it") || !strings.Contains(running, "Do not end your turn while it is running") {
+		t.Fatalf("tty running session should point at /attach and keep-poll guidance: %q", running)
 	}
-	target := mgr.sessions[1000]
-
-	stop := make(chan struct{})
-	var writer sync.WaitGroup
-	writer.Add(1)
-	go func() {
-		defer writer.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				target.touch()
-			}
-		}
-	}()
-
-	for i := 0; i < 2000; i++ {
-		mgr.mu.Lock()
-		_ = mgr.sessionToPruneLocked()
-		mgr.mu.Unlock()
+	exited := formatExecCommandOutput("", 1007, true, 0, false, true)
+	if strings.Contains(exited, "/attach") {
+		t.Fatalf("exited session should not mention /attach: %q", exited)
 	}
-	close(stop)
-	writer.Wait()
+	pipes := formatExecCommandOutput("", 1007, false, 0, false, false)
+	if strings.Contains(pipes, "/attach") {
+		t.Fatalf("non-tty session should not mention /attach: %q", pipes)
+	}
+}
+
+func TestExecCommandInteractiveBlockSuggestsTTY(t *testing.T) {
+	tool := NewScopedExecCommandTool(t.TempDir(), nil, newExecSessionManager())
+	result := tool.Run(context.Background(), map[string]any{"cmd": "ssh host.example.com"})
+	if result.Status != StatusError || result.Meta["safety_block"] != "interactive_command" {
+		t.Fatalf("expected interactive safety block, got meta=%#v output=%q", result.Meta, result.Output)
+	}
+	if !strings.Contains(result.Output, "tty:true") {
+		t.Fatalf("block output should suggest tty:true: %q", result.Output)
+	}
+}
+
+func TestExecCommandTTYSkipsInteractiveBlock(t *testing.T) {
+	tool := NewScopedExecCommandTool(t.TempDir(), nil, newExecSessionManager())
+	// ssh to a bogus host fails fast on its own; the point is that the
+	// interactive guard must not fire ahead of the tty path.
+	result := tool.Run(context.Background(), map[string]any{
+		"cmd": "ssh host.example.com", "tty": true, "yield_time_ms": 250,
+	})
+	if result.Meta["safety_block"] == "interactive_command" {
+		t.Fatalf("tty:true should not hit the interactive block: %#v", result.Meta)
+	}
+}
+
+func TestFormatExecCommandOutputNoNewPrivilegesHint(t *testing.T) {
+	blocked := formatExecCommandOutput(`sudo: The "no new privileges" flag is set`, 1007, true, 1, false, true)
+	if !strings.Contains(blocked, `sandbox_permissions "require_escalated"`) {
+		t.Fatalf("no_new_privs failure should hint at require_escalated: %q", blocked)
+	}
+	normal := formatExecCommandOutput("some other error", 1007, true, 1, false, true)
+	if strings.Contains(normal, "require_escalated") {
+		t.Fatalf("unrelated failure should not hint at require_escalated: %q", normal)
+	}
+	blockedOK := formatExecCommandOutput(`sudo: The "no new privileges" flag is set`, 1007, true, 0, false, true)
+	if strings.Contains(blockedOK, "require_escalated") {
+		t.Fatalf("zero-exit output should not hint at require_escalated: %q", blockedOK)
+	}
 }

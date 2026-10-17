@@ -272,7 +272,8 @@ sequenceDiagram
         Agent->>Tool: execute(ctx, args)
         Tool-->>Agent: output, error, metadata
         Agent->>Hooks: afterTool hooks
-        Agent->>Agent: redact, truncate, classify success/failure
+        Agent->>Agent: redact secrets, apply semantic output budget, enforce byte ceiling
+        Agent->>Agent: classify success/failure
         Agent-->>Surface: OnToolResult callback
         Agent->>Transcript: append tool result message
     end
@@ -301,8 +302,9 @@ Conceptually, one requested tool goes through these phases:
    the model can inspect it and decide what to do next.
 6. **Render and persist** — the result is surfaced to the TUI, stream-JSON
    writer, or ACP client. TUI and exec record rich tool/session events for
-   resume/history; ACP currently persists conversational messages and streams
-   tool/permission updates to the client.
+   resume/history; ACP persists conversational messages and completed tool-call
+   starts/results for load replay. Live streaming details and permission
+   exchanges remain client notifications rather than durable history.
 
 Tool success and failure are both informative context. A successful `read_file`
 result gives the model file contents; a failed `edit_file` result gives the model
@@ -604,9 +606,21 @@ flowchart TD
     Prompt -- Yes --> Decision[Permission callback]
     Prompt -- No --> Run[Registry.RunWithOptions]
     Decision --> Run
-    Run --> Redact[Redact secrets + enforce output ceiling]
-    Redact --> Message[Return tool result to model]
+    Run --> Redact[Redact secrets]
+    Redact --> Budget[Token-aware semantic output budget]
+    Budget --> Ceiling[Existing hard byte ceiling]
+    Ceiling --> Message[Return one tool result to model]
 ```
+
+Oversized results use deterministic, provider-neutral estimated-token budgets.
+Policies retain useful structure for files, search matches, tests, process logs,
+diffs, and worker conclusions; tools without a declared category use a UTF-8-safe
+head/tail fallback. The estimate is intentionally conservative for non-ASCII
+text and is not exact provider tokenization. Existing byte ceilings remain the
+authoritative safety limit. When the existing spill mechanism can persist the
+complete redacted text received by the budgeting layer, the result includes its
+safe spill reference. This does not imply capture of subprocess bytes already
+discarded by a tool's established internal buffer.
 
 Core tool groups include:
 
@@ -614,7 +628,12 @@ Core tool groups include:
   skills, `ask_user`, permission requests.
 - **Write tools**: `write_file`, `edit_file`, `apply_patch`, `update_plan`.
 - **Shell tools**: `exec_command`, `write_stdin`, legacy `bash`.
-- **Network tools**: `web_fetch` and optional web search backend.
+- **Network tools**: `web_fetch` and optional web search backend. `web_fetch`
+  validates the URL before the permission prompt, refuses loopback/private/
+  special-use addresses, and dials the address it resolved. With
+  `HTTP_PROXY`/`HTTPS_PROXY` set, the proxy is dialed instead and resolves the
+  target itself, so destination enforcement ends at the proxy; see the note in
+  the README.
 - **Local-control tools**: config-gated wrappers for browser, terminal, desktop,
   and artifact helpers backed by packages such as `internal/localcontrol` and
   `internal/browser`.
@@ -733,9 +752,10 @@ flowchart TD
 - **Skills** are instruction packs the model can load on demand.
 - **Specialists** are sub-agents callable through the `Task` tool.
 - **MCP servers** contribute external tools.
-- **Plugins** can add tools, hooks, and skill roots. Bootstrap merges plugin skill
-  roots into the runtime skill tool and prompt-visible skill list; the base
-  `internal/skills` scanner still scans one root at a time.
+- **Plugins** can add tools, hooks, and skill roots. Bootstrap always registers a
+  multi-root skill tool: primary Zero skills dir, optional `~/.agents/skills`,
+  then plugin skill roots (earlier wins). `internal/skills` owns that merge via
+  `LoadFromRoots`; single-root `Load` remains for install/write.
 - **Hooks** can observe or block tool lifecycle events.
 
 ## End-to-End Data Flow

@@ -45,6 +45,16 @@ type Token struct {
 	// `chatgpt_account_id`) that the request path needs as headers. Treated as
 	// sensitive like the access token: never logged, persisted 0600.
 	IDToken string `json:"id_token,omitempty"`
+	// TokenEndpoint, ClientID and ClientSecret record what a login learned that
+	// config does not carry (a discovered token endpoint, a dynamically
+	// registered client) so a later refresh can reuse it. ClientSecret is
+	// sensitive like the tokens. ProtectedTokenEndpoint marks an endpoint
+	// advertised by the server, which must be re-checked against the public
+	// network policy before a refresh posts credentials to it.
+	TokenEndpoint          string `json:"token_endpoint,omitempty"`
+	ProtectedTokenEndpoint bool   `json:"protected_token_endpoint,omitempty"`
+	ClientID               string `json:"client_id,omitempty"`
+	ClientSecret           string `json:"client_secret,omitempty"`
 }
 
 // Expired reports whether the token has an expiry that is at or before now.
@@ -90,6 +100,11 @@ var (
 	// ErrInsecureTokenEndpoint is returned when a credential would be sent over a
 	// non-https, non-loopback endpoint.
 	ErrInsecureTokenEndpoint = errors.New("oauth: refusing to send credential to a non-https token endpoint")
+	// ErrUnsafeRedirect is returned when a credential-bearing OAuth POST (token
+	// exchange/refresh, device authorization, or device-token poll) is redirected.
+	// Following it would replay the form body — codes, PKCE verifiers, refresh
+	// tokens, client secrets — to a target that never passed endpoint validation.
+	ErrUnsafeRedirect = errors.New("oauth: refusing to follow a redirect from a credential endpoint")
 	// ErrNoRefreshToken is returned when a refresh is attempted without one.
 	ErrNoRefreshToken = errors.New("oauth: no refresh token available")
 	// ErrAuthorizationPending is the RFC 8628 "keep polling" signal.

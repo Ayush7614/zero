@@ -5,9 +5,16 @@
 <p align="center"><strong>A terminal coding agent you own.</strong></p>
 
 <p align="center">
+  <a href="https://trendshift.io/repositories/70679?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-70679" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/70679/daily?language=Go" alt="Twigpine/zero | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/70679?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-70679" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/70679/weekly?language=Go" alt="Twigpine/zero | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/70679?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-70679" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/70679" alt="Twigpine/zero | Trendshift" width="250" height="55"/></a>
+</p>
+
+<p align="center">
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue"></a>
-  <img alt="Go 1.26.5+" src="https://img.shields.io/badge/Go-1.26.5+-00ADD8?logo=go&logoColor=white">
+  <img alt="Go 1.26.9+" src="https://img.shields.io/badge/Go-1.26.9+-00ADD8?logo=go&logoColor=white">
   <img alt="25+ providers" src="https://img.shields.io/badge/providers-25+-34E2EA">
+  <a href="https://discord.gg/CaQDS6wdFn"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
   <br>
   <strong>English</strong> | <a href="README_ZH.md">中文</a>
 </p>
@@ -22,10 +29,74 @@ zero exec "fix the failing test in ./pkg"
 zero exec --output-format stream-json < turns.jsonl
 ```
 
+## Partners
+
+<table align="center">
+  <tr>
+    <td align="center" width="150" height="80">
+      <a href="https://twigpine.com">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="https://twigpine.com/logo-dark.png">
+          <img src="https://twigpine.com/logo.png" alt="Twigpine logo" width="72">
+        </picture>
+      </a>
+    </td>
+    <td align="center" width="150" height="80">
+      <a href="https://mimo.mi.com">
+        <img src="https://mimo.xiaomi.com/mimo-v2-pro/assets/logo.svg" alt="Xiaomi MiMo logo" width="136">
+      </a>
+    </td>
+    <td align="center" width="150" height="80">
+      <a href="https://novita.ai/">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="docs/assets/novita-logo-dark.svg">
+          <img src="docs/assets/novita-logo.svg" alt="Novita AI logo" width="136">
+        </picture>
+      </a>
+    </td>
+    <td align="center" width="150" height="80">
+      <a href="https://concentrate.ai/">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="docs/assets/concentrate-logo-dark.svg">
+          <img src="docs/assets/concentrate-logo.svg" alt="Concentrate logo" width="64">
+        </picture>
+      </a>
+    </td>
+    <td align="center" width="150" height="80">
+      <a href="https://exa.ai/">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="docs/assets/exa-logo-dark.svg">
+          <img src="docs/assets/exa-logo.svg" alt="Exa logo" width="110">
+        </picture>
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://twigpine.com"><strong>Twigpine</strong></a></td>
+    <td align="center"><a href="https://mimo.mi.com"><strong>Xiaomi MiMo</strong></a></td>
+    <td align="center"><a href="https://novita.ai/"><strong>Novita AI</strong></a></td>
+    <td align="center"><a href="https://concentrate.ai/"><strong>Concentrate</strong></a></td>
+    <td align="center"><a href="https://exa.ai/"><strong>Exa</strong></a></td>
+  </tr>
+  <tr>
+    <td align="center" width="150" height="80">
+      <a href="https://www.gmicloud.ai/">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="docs/assets/gmi-cloud-logo-dark.svg">
+          <img src="docs/assets/gmi-cloud-logo.svg" alt="GMI Cloud logo" width="120">
+        </picture>
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://www.gmicloud.ai/"><strong>GMI Cloud</strong></a></td>
+  </tr>
+</table>
+
 ## Why Zero
 
 - **Use the model you want.** Bring OpenAI, Anthropic, Gemini, Groq, OpenRouter,
-  DeepSeek, Mistral, xAI, Qwen, Kimi, GitHub Models, Ollama, LM Studio, or any
+  DeepSeek, Mistral, xAI, Qwen, Kimi, GitHub Models, Ollama, LM Studio, Atomic Chat, or any
   OpenAI-/Anthropic-compatible endpoint.
 - **Stay in control.** File writes, shell commands, network access, and
   out-of-workspace writes go through Zero's permission and sandbox policy.
@@ -45,7 +116,7 @@ zero exec --output-format stream-json < turns.jsonl
 ### npm
 
 ```bash
-npm install -g @gitlawb/zero
+npm install -g @twigpine/zero
 zero
 ```
 
@@ -59,26 +130,38 @@ matching GitHub Release whenever it is missing. Windows on ARM runs the x64
 build under emulation. See [docs/NPM_PACKAGING.md](docs/NPM_PACKAGING.md) for
 how the package is put together.
 
+Installed Zero as `@gitlawb/zero`? The package moved to `@twigpine/zero` in
+0.10.0 and the old name gets no further releases. Both packages provide the
+`zero` command, so quit any running `zero`, then remove the old package first:
+
+```bash
+npm uninstall -g @gitlawb/zero
+npm install -g @twigpine/zero
+```
+
+Your config, sessions, and logins are kept; they live outside the package. For
+Bun, pnpm, and yarn, see [docs/INSTALL.md](docs/INSTALL.md#moving-from-gitlawbzero).
+
 ### Install scripts
 
 Linux/macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Gitlawb/zero/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Twigpine/zero/main/scripts/install.sh | bash
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/Gitlawb/zero/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/Twigpine/zero/main/scripts/install.ps1 | iex
 ```
 
 ### From source
 
-Source builds require Go 1.26.5+.
+Source builds require Go 1.26.9+.
 
 ```bash
-git clone https://github.com/Gitlawb/zero.git
+git clone https://github.com/Twigpine/zero.git
 cd zero
 go run ./cmd/zero
 ```
@@ -90,17 +173,18 @@ If you are testing before the first public release, build from source:
 go build -o zero ./cmd/zero
 ```
 
-On Linux, build the sandbox helper too if you want native sandboxing:
+On Linux, native sandboxing needs Bubblewrap. The main `zero` binary re-executes
+itself as the helper when `zero-linux-sandbox` is absent. A separate helper next
+to `zero` or on `PATH` still takes precedence:
 
 ```bash
-go build -o zero-linux-sandbox ./cmd/zero-linux-sandbox
-go build -o zero-seccomp ./cmd/zero-seccomp   # optional compatibility wrapper
+go build -o zero-linux-sandbox ./cmd/zero-linux-sandbox   # optional
+go build -o zero-seccomp ./cmd/zero-seccomp               # optional compatibility wrapper
 ```
 
-Put `zero` and `zero-linux-sandbox` in the same directory on `PATH`
-(`~/.local/bin` is a good default). macOS does not need an extra helper binary.
-Windows source builds can use the main `zero.exe` as their sandbox helper; release
-archives still ship standalone Windows helper executables.
+Put `zero` on `PATH` (`~/.local/bin` is a good default). macOS does not need an
+extra helper binary. Windows source builds can use the main `zero.exe` as their
+sandbox helper; release archives still ship standalone Windows helper executables.
 
 More install details: [docs/INSTALL.md](docs/INSTALL.md).
 
@@ -129,15 +213,43 @@ the key in the wizard:
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=...
 export GEMINI_API_KEY=...
+export AIMLAPI_API_KEY=...
 export LONGCAT_API_KEY=...
+export FIREWORKS_API_KEY=...
+export GMI_API_KEY=...
+export CONCENTRATE_API_KEY=...
 export MINIMAX_API_KEY=...
 export MINIMAXI_API_KEY=...
+```
+
+To configure AI/ML API directly, run:
+
+```bash
+zero providers setup aimlapi --set-active
 ```
 
 To configure Meituan LongCat (LongCat-2.0) directly, run:
 
 ```bash
 zero providers setup longcat --set-active
+```
+
+To configure Fireworks AI directly, run:
+
+```bash
+zero providers setup fireworks --set-active
+```
+
+To configure GMI Cloud directly, run:
+
+```bash
+zero providers setup gmicloud --set-active
+```
+
+To configure Concentrate directly, run:
+
+```bash
+zero providers setup concentrate --set-active
 ```
 
 MiniMax presets use the Anthropic-compatible endpoints for the global and China
@@ -167,8 +279,12 @@ zero providers add custom-openai-compatible \
   --set-active
 ```
 
-For local models, run Ollama or LM Studio and then use `zero setup` or
-`zero providers detect`.
+For local models, run Ollama, LM Studio, or the [Atomic Chat](https://atomic.chat)
+desktop app, then use `zero setup` or `zero providers detect`. For Atomic Chat,
+load a model and enable its local OpenAI-compatible API (default
+`http://127.0.0.1:1337/v1`). Choose `atomic-chat-local`; detection includes the
+loaded model ID in the add command. If no usable ID is discovered, load a model
+and retry. Model IDs requiring shell-specific quoting use interactive setup.
 
 ## Daily Use
 
@@ -184,9 +300,11 @@ Useful controls:
 |---|---|
 | `Enter` | send the prompt |
 | `/` | open slash-command suggestions |
+| `Ctrl+X` then letter | common slash commands (e.g. `m` → `/model`; `Ctrl+X` `?` for full list) |
+| `Ctrl+P` / `Ctrl+N` | previous / next item in menus (arrows still work) |
 | `Shift+Tab` | cycle permission mode |
 | `Ctrl+B` | show/hide the sidebar |
-| `Ctrl+C` | cancel or exit |
+| `Ctrl+C` | cancel, exit, or return from a `/btw` conversation |
 
 Common slash commands:
 
@@ -196,6 +314,8 @@ Common slash commands:
 | `/spec`, `/plan` | draft and review a plan before building |
 | `/image` | attach an image for vision-capable models |
 | `/resume`, `/rewind` | continue or roll back local sessions |
+| `/new` | start a fresh session in place (previous session stays on disk) |
+| `/btw [question]` | ask in an isolated fork without adding the side conversation to the main session |
 | `/loop` | repeat a prompt or custom `/command` on an interval (`/loop 5m /babysit-prs`) or self-paced |
 | `/compact`, `/context` | manage context usage |
 | `/permissions`, `/tools` | inspect available tools and policy |
@@ -254,6 +374,19 @@ zero sandbox grants list
 Zero includes local file/search/edit/shell tools, `web_fetch` for public URLs,
 and MCP support for additional tools.
 
+`web_fetch` refuses loopback, private and other special-use addresses: it checks
+the URL before asking permission, resolves the host, and dials the address it
+validated so a name cannot resolve to something else in between.
+
+If `HTTP_PROXY`/`HTTPS_PROXY` is set, `web_fetch` and the provider connectivity
+probe use it, and that last step changes: the proxy is dialed and the target
+hostname is sent to it, so the proxy decides which address the request actually
+reaches. The URL is still checked and resolved locally first, but a proxy that
+answers differently can reach a private service. A forward proxy already sees
+and can rewrite every request through it, so this is the trust you accept by
+configuring one. Leave the variables unset for the checks to be enforced end to
+end.
+
 For local dev servers, use shell commands such as `curl` through `exec_command`
 so the normal sandbox and permission policy applies. Long-running commands stay
 attached to a background terminal session and can be listed or stopped from the
@@ -277,7 +410,7 @@ zero context          context-budget report
 zero repo-map         deterministic repository map
 zero repo-info        local repository summary
 zero search | find    search local session history
-zero sessions         inspect, resume, fork, and rewind sessions
+zero sessions         inspect, resume, fork, rewind, and prune sessions
 zero spec             manage spec-mode drafts
 zero specialist       manage specialist subagents
 zero skills           manage markdown instruction skills
@@ -291,8 +424,16 @@ zero verify           detect and run local verification checks
 zero changes          inspect and commit local git changes
 zero usage            token usage and estimated cost
 zero cron             scheduled agent jobs
-zero update           check for newer releases
+zero update --check   check for newer releases
+zero upgrade          download, verify, and install the latest release
 ```
+
+Cron keeps the newest 1,000 run outcomes per job in `runs.jsonl`. Each new run
+atomically replaces the history with the retained tail; existing larger histories
+are trimmed on their next run. Archive the file before that run if you need older
+outcomes. This retention does not delete session directories or reset fire counts.
+Malformed records and legacy lines of 1 MiB or more are skipped when reading or
+compacting history; new records of that size are rejected.
 
 ## Extending Zero
 
@@ -332,7 +473,7 @@ manifest.
 | Control | Effect |
 |---|---|
 | `NO_COLOR=<anything>` | disables color output |
-| `ZERO_THEME=<name>` | selects the startup theme (`auto`, `dark`, `light`, or a color theme like `dracula`, `nord`, `gruvbox`, `tokyo-night`, `catppuccin`, `one-dark`, `solarized-dark`, `rose-pine`, `everforest`, `solarized-light`) |
+| `ZERO_THEME=<name>` | selects the startup theme (`auto`, `dark`, `light`, or a color theme like `dracula`, `nord`, `gruvbox`, `tokyo-night`, `catppuccin`, `one-dark`, `solarized-dark`, `rose-pine`, `everforest`, `neon`, `solarized-light`, `dune`) |
 | `--theme <name>` | selects the TUI theme from the CLI (same names) |
 | `/theme` | opens the theme picker inside the TUI (live preview; `/theme <name>` switches directly) |
 | `ZERO_NO_FADE=1` | disables streaming fade animation |
@@ -349,23 +490,36 @@ go run ./cmd/zero-release smoke
 go run ./cmd/zero-perf-bench
 ```
 
+Experimental: `ZERO_OPENAI_TURN_SESSION=1` enables the optimized OpenAI turn
+session (background connection prewarm + request-prefix telemetry) for headless
+`zero exec` runs against official OpenAI profiles. Off by default; `0`, `false`,
+or `off` disable it. A/B-benchmark it by running the same `zero-perf-bench` suite
+with the variable unset and set.
+
+Native ChatGPT Responses sessions are enabled by default. Set
+`ZERO_CHATGPT_TURN_SESSION=0`, `false`, or `off` to restore stateless HTTP/SSE
+transport.
+
 ### Code Quality and Security Checks
 
-Before committing any changes, ensure all Go code quality and security checks pass. Pinned `go run` commands matching CI constraints can be used directly without prior installation:
+Before committing any changes, ensure all Go code quality and security checks pass. The `make` targets below pin each tool to this module's Go version, so they load correctly even when your default `go` toolchain is older — running the plain `go run ...@version` form yourself can select the tool module's own (older) toolchain and fail to load this module instead.
 
-1. **Formatting**: Run `go fmt ./...` (or `make fmt`).
-2. **Vetting**: Run `go vet ./...` (or `make vet`).
-3. **Linting**: Run `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --enable-only unused,ineffassign,staticcheck ./...`.
-4. **Vulnerability Scan**: Run `go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...`.
+1. **Formatting**: Run `make fmt` (or `go fmt ./...`).
+2. **Vetting**: Run `make vet` (or `go vet ./...`).
+3. **Linting**: Run `make lint-static`.
+4. **Vulnerability Scan**: Run `make vulncheck`.
 
-If you prefer to install these tools globally on your path, you can run:
+Use the repository-managed targets rather than globally installed binaries:
+the targets apply the module's required Go toolchain as well as the reviewed,
+pinned tool versions.
+
+The installed binaries land in `$GOBIN` when it is set, otherwise in
+`$GOPATH/bin` (default `~/go/bin`). That directory must be on your `PATH` to
+run them directly. If it isn't, add it:
 
 ```bash
-# Install golangci-lint
-go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
-
-# Install govulncheck
-go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+gobin="$(go env GOBIN)"; [ -z "$gobin" ] && gobin="$(go env GOPATH)/bin"
+case ":$PATH:" in *":$gobin:"*) ;; *) export PATH="$PATH:$gobin" ;; esac
 ```
 
 ### Cross-Compile Examples
@@ -379,12 +533,33 @@ go run ./cmd/zero-release build --goos windows --goarch amd64 --output dist/zero
 
 - [Install](docs/INSTALL.md)
 - [Update flow](docs/UPDATE.md)
+- [Themes](docs/THEMES.md)
 - [Stream-JSON protocol](docs/STREAM_JSON_PROTOCOL.md)
 - [Specialists](docs/SPECIALISTS.md)
 - [GitHub Action](docs/GITHUB_ACTION.md)
 - [Benchmarks](docs/BENCHMARK.md)
 - [Performance](docs/PERFORMANCE.md)
 - [Agent evals](docs/AGENT_EVALS.md)
+
+## Community
+
+Real-time chat happens on the [Discord server](https://discord.gg/CaQDS6wdFn).
+
+Questions, setup help, ideas, and sharing all live in
+[GitHub Discussions](https://github.com/Twigpine/zero/discussions):
+
+| Category | Use it for |
+|---|---|
+| [Q&A](https://github.com/Twigpine/zero/discussions/categories/q-a) | Setup help, provider/model configuration, "how do I" questions |
+| [Ideas](https://github.com/Twigpine/zero/discussions/categories/ideas) | Feature proposals and design discussion before any PR |
+| [Show and tell](https://github.com/Twigpine/zero/discussions/categories/show-and-tell) | Your skills, plugins, MCP setups, themes, and workflows |
+| [Announcements](https://github.com/Twigpine/zero/discussions/categories/announcements) | Releases and project news from the maintainers |
+
+For a good Q&A answer fast, include `zero --version`, your OS and install
+method, the provider/model in use, and `zero doctor` output. See
+[SUPPORT.md](SUPPORT.md). Bugs belong in
+[issues](https://github.com/Twigpine/zero/issues/new/choose); security reports
+follow [SECURITY.md](SECURITY.md), never a public thread.
 
 ## Contributing
 

@@ -8,8 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/execution"
+	"github.com/Twigpine/zero/internal/tools"
 )
 
 // defaultConnectTimeout bounds how long startup waits for ONE MCP server to
@@ -22,10 +23,15 @@ const defaultConnectTimeout = 8 * time.Second
 type RegisterOptions struct {
 	PermissionStore *PermissionStore
 	Autonomy        PermissionAutonomy
+	// AdvertiseInAuto exposes prompt-gated MCP tools to model surfaces whose
+	// default mode is auto while preserving the execution-time prompt.
+	AdvertiseInAuto bool
 	ClientFactory   func(context.Context, Server) (ToolClient, error)
 	// ConnectTimeout bounds the per-server connect+list at startup. Zero uses
 	// defaultConnectTimeout.
 	ConnectTimeout time.Duration
+	Execution      *execution.Runner
+	WorkspaceRoot  string
 }
 
 // SkippedServer records an MCP server that was not registered because it could
@@ -80,7 +86,7 @@ func RegisterTools(ctx context.Context, registry *tools.Registry, cfg config.MCP
 	factory := options.ClientFactory
 	if factory == nil {
 		factory = func(ctx context.Context, server Server) (ToolClient, error) {
-			return Connect(ctx, server)
+			return ConnectWithOptions(ctx, server, ConnectOptions{Execution: options.Execution, WorkspaceRoot: options.WorkspaceRoot})
 		}
 	}
 
@@ -173,9 +179,11 @@ func RegisterTools(ctx context.Context, registry *tools.Registry, cfg config.MCP
 			staged = append(staged, tool)
 		}
 	}
-	for _, tool := range staged {
-		registry.Register(tool)
+	registered := make([]tools.Tool, 0, len(staged))
+	for index := range staged {
+		registered = append(registered, staged[index])
 	}
+	registry.RegisterBatch(registered)
 	return runtime, nil
 }
 
@@ -266,9 +274,10 @@ func newRegistryTool(server Server, remote RemoteTool, client ToolClient, option
 		client:     client,
 		parameters: SchemaFromMCP(remote.InputSchema),
 		safety: tools.Safety{
-			SideEffect: tools.SideEffectNetwork,
-			Permission: permission,
-			Reason:     fmt.Sprintf("MCP tool %s/%s runs through the configured %s server.", server.Name, remote.Name, server.Type),
+			SideEffect:      tools.SideEffectNetwork,
+			Permission:      permission,
+			Reason:          fmt.Sprintf("MCP tool %s/%s runs through the configured %s server.", server.Name, remote.Name, server.Type),
+			AdvertiseInAuto: options.AdvertiseInAuto,
 		},
 	}
 }
@@ -322,12 +331,64 @@ func (tool registryTool) Run(ctx context.Context, args map[string]any) tools.Res
 		status = tools.StatusError
 	}
 	output := TextContent(result.Content)
+	images, disp, limitReason := forwardImages(result.Content)
+	// Image blocks with valid data ride Result.Images, the same channel capture
+	// tools already use. Everything else non-text is still named rather than
+	// silently dropped, because Zero still has nowhere to put audio, embedded
+	// resources, or a block whose payload could not be decoded (#823).
+	//
+	// Conversion happens once: the drop note is built from the same pass's
+	// per-item disposition, so a valid image is not decoded again just to
+	// decide whether it was forwarded.
+	//
+	// Image-only success has no text block, so a one-line placeholder keeps
+	// the tool_result self-describing. ModelOutput and finalizeToolOutcome
+	// copy Output through verbatim; an empty string would hand the model an
+	// empty body next to the image.
+	//
+	// Notes are appended only when something was actually dropped, so a
+	// text-only result is byte-for-byte what it was before, and a successfully
+	// forwarded image is not described as unforwardable.
+	//
+	// Unforwardable blocks (audio, resource, failed decode) say retrying
+	// cannot RECOVER the payload: Zero still has nowhere to put them.
+	// Budget-skipped images are different — Zero can forward them, and a
+	// retry with fewer images can recover the payload — so they get their
+	// own sentence.
+	if output == "" && len(images) > 0 {
+		output = "[image returned by tool]"
+	}
+	if exceeded := droppedContentNote(result.Content, disp, dispBudgetExceeded); exceeded != "" {
+		output = appendServerNote(output, exceeded,
+			", which exceeded this result's remaining image budget. Retrying with fewer images can recover this payload.")
+	}
+	if uninspected := droppedContentNote(result.Content, disp, dispUninspected); uninspected != "" {
+		verb := ", which were not inspected"
+		if dispCount(disp, dispUninspected) == 1 {
+			verb = ", which was not inspected"
+		}
+		var cause string
+		switch limitReason {
+		case imageLimitForwardCount:
+			cause = " because the maximum forwarded image count was reached."
+		case imageLimitInspectionCount:
+			cause = " because the maximum image inspection limit was reached."
+		default:
+			cause = " because the aggregate image budget was reached."
+		}
+		output = appendServerNote(output, uninspected, verb+cause)
+	}
+	if dropped := droppedContentNote(result.Content, disp, dispDropped); dropped != "" {
+		output = appendServerNote(output, dropped,
+			", which Zero cannot forward yet. Retrying cannot recover this payload.")
+	}
 	if output == "" {
 		output = "(empty MCP tool result)"
 	}
 	return tools.Result{
 		Status: status,
 		Output: output,
+		Images: images,
 		Meta:   tool.meta(),
 	}
 }
@@ -371,4 +432,14 @@ func isPersistentlyApproved(store *PermissionStore, server Server, toolName stri
 		RequestedAutonomy: autonomy,
 	})
 	return err == nil && approved
+}
+
+// appendServerNote joins a [zero] note to output, choosing "returned" or
+// "also returned" based on whether anything precedes it.
+func appendServerNote(output, subject, tail string) string {
+	verb := "this server also returned "
+	if output == "" {
+		verb = "this server returned "
+	}
+	return strings.TrimSpace(output + "\n\n[zero] " + verb + subject + tail)
 }

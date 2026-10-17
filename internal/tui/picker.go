@@ -9,11 +9,13 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/providercatalog"
-	"github.com/Gitlawb/zero/internal/providermodelcatalog"
-	"github.com/Gitlawb/zero/internal/providermodeldiscovery"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/notify"
+	"github.com/Twigpine/zero/internal/providercatalog"
+	"github.com/Twigpine/zero/internal/providermodelcatalog"
+	"github.com/Twigpine/zero/internal/providermodeldiscovery"
+	"github.com/Twigpine/zero/internal/providers"
 )
 
 // pickerKind identifies which command a picker selection feeds back into.
@@ -27,25 +29,37 @@ const (
 	pickerSkill
 	pickerSTTModel
 	pickerSTTDownload
+	pickerPet
+	pickerNotify
 )
 
 // pickerItem is one selectable row: Label is shown, Value is passed to the
 // underlying command handler when chosen. Meta is the optional right-aligned
 // readout (ctx window · capabilities); the dot flags mark provider locality
-// for model rows (accent = remote, blue = local).
+// for model rows (accent = remote, blue = local). Detail is an optional faint
+// second line under the row (project · model · size for sessions), rendered
+// only on medium-and-wider tiers where the extra line reads cleanly.
 type pickerItem struct {
 	Group    string
 	Label    string
 	Value    string
 	Meta     string
+	Detail   string
 	Provider string // display tag (catalog id / locality)
 	// OwnerProvider is the saved provider profile name a model belongs to, so the
 	// /model picker can switch providers when a model from a non-active provider is
 	// chosen. Empty for non-model items.
 	OwnerProvider string
-	Remote        bool
-	Local         bool
-	Favorite      bool
+	// OwnerLabel names the provider Enter will actually use for a row in a
+	// mixed-provider group (Recent, Favorites), whose section header cannot
+	// convey it. Empty for provider-grouped rows.
+	OwnerLabel string
+	// OwnerNumber distinguishes abbreviated names, even when their visible
+	// suffixes coincide. It is the saved-profile position (1-based).
+	OwnerNumber int
+	Remote      bool
+	Local       bool
+	Favorite    bool
 }
 
 // commandPicker is a generic single-select overlay reused by /model and /effort
@@ -165,7 +179,7 @@ func (p *commandPicker) applyQuery() {
 // the joined haystack, and a fuzzy subsequence is the last-resort match.
 func scorePickerItem(item pickerItem, query string) (int, bool) {
 	label := strings.ToLower(item.Label)
-	hay := strings.ToLower(strings.Join([]string{item.Group, item.Label, item.Value, item.Meta}, " "))
+	hay := strings.ToLower(strings.Join([]string{item.Group, item.Label, item.Value, item.Meta, item.Detail}, " "))
 	switch {
 	case label == query:
 		return 0, true
@@ -284,10 +298,19 @@ func (m model) savedProviderModelPickerItems(profile config.ProviderProfile, act
 	descriptor, hasDescriptor := m.descriptorForProfile(profile)
 	group := modelPickerProviderGroup(profile, descriptor, hasDescriptor)
 
+	endpointKey := providerEndpointKey(profile, descriptor)
+	var discovered []providermodeldiscovery.Model
+	if endpointKey != "" {
+		discovered = m.modelPickerLiveByProvider[endpointKey]
+	}
+	if len(discovered) == 0 && hasDescriptor && !genericProviderCatalogID(descriptor.ID) {
+		discovered = m.modelPickerLiveByProvider[descriptor.ID]
+	}
+
 	var raw []pickerItem
 	switch {
-	case hasDescriptor && len(m.modelPickerLiveByProvider[descriptor.ID]) > 0:
-		for _, model := range m.modelPickerLiveByProvider[descriptor.ID] {
+	case len(discovered) > 0:
+		for _, model := range discovered {
 			if strings.TrimSpace(model.ID) == "" {
 				continue
 			}
@@ -370,17 +393,24 @@ func (m model) openModelPicker() (model, tea.Cmd) {
 }
 
 // modelPickerDiscoveryCmds dispatches a live model-discovery command for each
-// usable provider (deduped by catalog descriptor), so /model shows the same real
+// usable provider (deduped by endpoint key), so /model shows the same real
 // models the provider-setup wizard discovers.
 func (m model) modelPickerDiscoveryCmds() tea.Cmd {
 	cmds := []tea.Cmd{}
 	seen := map[string]bool{}
 	for _, profile := range m.modelPickerProviders() {
 		descriptor, ok := m.descriptorForProfile(profile)
-		if !ok || seen[descriptor.ID] {
+		if !ok {
 			continue
 		}
-		seen[descriptor.ID] = true
+		endpointKey := providerEndpointKey(profile, descriptor)
+		if endpointKey == "" {
+			endpointKey = descriptor.ID
+		}
+		if seen[endpointKey] {
+			continue
+		}
+		seen[endpointKey] = true
 		if cmd := m.modelPickerProviderDiscoveryCmd(descriptor, profile); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
@@ -406,11 +436,13 @@ func (m model) modelPickerProviderDiscoveryCmd(descriptor providercatalog.Descri
 	needOAuth := key == "" && descriptor.OAuth && !descriptor.OAuthMintsKey
 	discover := m.discoverProviderModels
 	if discover == nil {
+		discoveryOptions := m.modelPickerDiscoveryOptions(authed)
 		discover = func(ctx context.Context, p config.ProviderProfile) ([]providermodeldiscovery.Model, error) {
-			return providermodeldiscovery.DiscoverCatalog(ctx, descriptor, p, providermodeldiscovery.Options{})
+			return providermodeldiscovery.DiscoverCatalog(ctx, descriptor, p, discoveryOptions)
 		}
 	}
 	providerID := descriptor.ID
+	endpointKey := providerEndpointKey(profile, descriptor)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(m.ctx, 8*time.Second)
 		defer cancel()
@@ -420,8 +452,22 @@ func (m model) modelPickerProviderDiscoveryCmd(descriptor providercatalog.Descri
 				k = resolved
 			}
 		}
-		models, err := discover(ctx, providerWizardDiscoveryProfile(descriptor, k))
-		return modelPickerModelsDiscoveredMsg{providerID: providerID, models: models, err: err}
+		models, err := discover(ctx, providerWizardDiscoveryProfile(descriptor, k, authed.BaseURL))
+		return modelPickerModelsDiscoveredMsg{
+			providerID:  providerID,
+			endpointKey: endpointKey,
+			models:      models,
+			err:         err,
+		}
+	}
+}
+
+func (m model) modelPickerDiscoveryOptions(profile config.ProviderProfile) providermodeldiscovery.Options {
+	oauthResolver, loginKey := providers.OAuthLoginForProfile(profile)
+	return providermodeldiscovery.Options{
+		OAuthResolver:        oauthResolver,
+		CodexAccountResolver: providers.CodexAccountResolverForLogin(loginKey),
+		UserAgent:            m.userAgent,
 	}
 }
 
@@ -447,6 +493,30 @@ func pickerItemDedupKey(item pickerItem) string {
 	return item.Value
 }
 
+// modelPickerSwitchOwner returns the saved provider that choosing item switches
+// to, or "" when the model is applied to the active provider: the owner is
+// blank, is the active provider, or (registry-fallback / stale-history rows
+// after a rename or removal) no longer resolves to a saved provider.
+func (m model) modelPickerSwitchOwner(item pickerItem) string {
+	owner := strings.TrimSpace(item.OwnerProvider)
+	if owner == "" || strings.EqualFold(owner, strings.TrimSpace(m.providerName)) {
+		return ""
+	}
+	if _, ok := m.savedProviderByName(owner); !ok {
+		return ""
+	}
+	return owner
+}
+
+// modelPickerEffectiveOwner names the provider choosing item will use, so a
+// row's owner label never promises a provider that selection falls back from.
+func (m model) modelPickerEffectiveOwner(item pickerItem) string {
+	if owner := m.modelPickerSwitchOwner(item); owner != "" {
+		return owner
+	}
+	return strings.TrimSpace(m.providerName)
+}
+
 func (m model) assembleModelPickerItems(recent []pickerItem, catalog []pickerItem) []pickerItem {
 	result := []pickerItem{}
 	// Favorites keep the pre-provider-aware semantics: one row per favorited
@@ -461,6 +531,7 @@ func (m model) assembleModelPickerItems(recent []pickerItem, catalog []pickerIte
 			}
 			item.Group = "Favorites"
 			item.Favorite = true
+			item.OwnerLabel = m.modelPickerEffectiveOwner(item)
 			result = append(result, item)
 			favoriteSeen[item.Value] = true
 		}
@@ -483,6 +554,7 @@ func (m model) assembleModelPickerItems(recent []pickerItem, catalog []pickerIte
 		}
 		item.Group = "Recent"
 		item.Favorite = m.favoriteModels[item.Value]
+		item.OwnerLabel = m.modelPickerEffectiveOwner(item)
 		result = append(result, item)
 		seen[key] = true
 	}
@@ -498,6 +570,17 @@ func (m model) assembleModelPickerItems(recent []pickerItem, catalog []pickerIte
 		result = append(result, item)
 		seen[key] = true
 	}
+	for i := range result {
+		if result[i].OwnerLabel == "" {
+			continue
+		}
+		for index, profile := range m.modelPickerProviders() {
+			if strings.EqualFold(strings.TrimSpace(profile.Name), result[i].OwnerLabel) {
+				result[i].OwnerNumber = index + 1
+				break
+			}
+		}
+	}
 	return result
 }
 
@@ -510,7 +593,41 @@ func (m model) recentModelPairsForPicker() []config.RecentModelEntry {
 	pairs := make([]config.RecentModelEntry, 0, len(m.recentModels)+1)
 	pairs = append(pairs, config.RecentModelEntry{Provider: m.providerName, Model: m.modelName})
 	pairs = append(pairs, m.recentModels...)
+	for index := range pairs {
+		pairs[index] = m.canonicalRecentModelPair(pairs[index])
+	}
 	return config.NormalizeRecentModels(pairs)
+}
+
+// canonicalRecentModelPair collapses legacy OpenAI-prefixed model IDs for a
+// ChatGPT profile. ChatGPT's Codex endpoint uses bare model IDs, while older
+// hand-entered configuration could retain the equivalent openai/<id> spelling.
+// Keep this picker-only so OpenAI-compatible gateway IDs remain untouched.
+func (m model) canonicalRecentModelPair(pair config.RecentModelEntry) config.RecentModelEntry {
+	pair.Provider = strings.TrimSpace(pair.Provider)
+	pair.Model = strings.TrimSpace(pair.Model)
+	if !m.recentPairUsesChatGPT(pair.Provider) {
+		return pair
+	}
+	if len(pair.Model) >= len("openai/") && strings.EqualFold(pair.Model[:len("openai/")], "openai/") {
+		pair.Model = strings.TrimSpace(pair.Model[len("openai/"):])
+	}
+	return pair
+}
+
+func (m model) recentPairUsesChatGPT(providerName string) bool {
+	if profile, ok := m.savedProviderByName(providerName); ok {
+		if descriptor, hasDescriptor := m.descriptorForProfile(profile); hasDescriptor {
+			return providercatalog.NormalizeID(descriptor.ID) == "chatgpt"
+		}
+	}
+	if !strings.EqualFold(strings.TrimSpace(providerName), strings.TrimSpace(m.providerName)) {
+		return false
+	}
+	if descriptor, ok := m.activeProviderDescriptor(); ok {
+		return providercatalog.NormalizeID(descriptor.ID) == "chatgpt"
+	}
+	return providercatalog.NormalizeID(m.providerProfile.CatalogID) == "chatgpt"
 }
 
 // modelPickerRecentItem resolves one "Recent" row for a provider+model pair,
@@ -662,7 +779,15 @@ func modelPickerTitleWord(word string) string {
 }
 
 func (m model) activeProviderDescriptor() (providercatalog.Descriptor, bool) {
-	return m.descriptorForProfile(m.providerProfile)
+	if descriptor, ok := m.descriptorForProfile(m.providerProfile); ok {
+		return descriptor, true
+	}
+	if name := strings.TrimSpace(m.providerName); name != "" {
+		if descriptor, ok := providercatalog.Get(name); ok {
+			return descriptor, true
+		}
+	}
+	return providercatalog.Descriptor{}, false
 }
 
 func customProviderDescriptorForProfile(profile config.ProviderProfile) (providercatalog.Descriptor, bool) {
@@ -733,10 +858,87 @@ func genericProviderCatalogID(id string) bool {
 	return strings.HasPrefix(strings.TrimSpace(id), "custom-")
 }
 
+// providerEndpointKey derives an endpoint route identity for profile discovery.
+// Profiles with an explicit Name use that name so distinct endpoints sharing a
+// generic descriptor (e.g. custom-openai-compatible) never collide.
+// Unnamed profiles qualify by base URL or descriptor ID.
+func providerEndpointKey(profile config.ProviderProfile, descriptor providercatalog.Descriptor) string {
+	if name := strings.TrimSpace(profile.Name); name != "" {
+		return name
+	}
+	if baseURL := normalizeProviderBaseURL(profile.BaseURL); baseURL != "" {
+		if descriptor.ID != "" {
+			return descriptor.ID + "@" + baseURL
+		}
+		return baseURL
+	}
+	if descriptor.ID != "" {
+		return descriptor.ID
+	}
+	if catID := strings.TrimSpace(profile.CatalogID); catID != "" {
+		return catID
+	}
+	return ""
+}
+
+// activeDiscoveryKeys returns candidate lookup keys for live-discovered models
+// belonging to the active provider endpoint route, in order of specificity.
+// Generic descriptors (custom-*) are excluded as fallback keys so one custom
+// endpoint's discovery cannot determine another endpoint's capabilities.
+func (m model) activeDiscoveryKeys() []string {
+	var keys []string
+	seen := map[string]bool{}
+	add := func(k string) {
+		k = strings.TrimSpace(k)
+		if k != "" && !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+
+	descriptor, hasDescriptor := m.activeProviderDescriptor()
+	if key := providerEndpointKey(m.providerProfile, descriptor); key != "" {
+		add(key)
+	}
+	if m.providerProfile.Name != "" {
+		add(m.providerProfile.Name)
+	}
+	if m.providerName != "" {
+		add(m.providerName)
+	}
+	if m.providerProfile.CatalogID != "" && !genericProviderCatalogID(m.providerProfile.CatalogID) {
+		add(m.providerProfile.CatalogID)
+	}
+	if hasDescriptor && !genericProviderCatalogID(descriptor.ID) {
+		add(descriptor.ID)
+	}
+	if len(keys) == 0 && len(m.modelPickerLiveByProvider) == 1 {
+		// When no active provider or profile is configured (e.g. dummy models in unit tests),
+		// accept the single available provider entry.
+		for id := range m.modelPickerLiveByProvider {
+			add(id)
+			break
+		}
+	}
+	return keys
+}
+
+// discoveredModelsForActiveRoute returns the live-discovered models for the active
+// endpoint route, if available in modelPickerLiveByProvider.
+func (m model) discoveredModelsForActiveRoute() ([]providermodeldiscovery.Model, bool) {
+	for _, key := range m.activeDiscoveryKeys() {
+		if models, ok := m.modelPickerLiveByProvider[key]; ok && len(models) > 0 {
+			return models, true
+		}
+	}
+	return nil, false
+}
+
 type modelPickerModelsDiscoveredMsg struct {
-	providerID string
-	models     []providermodeldiscovery.Model
-	err        error
+	providerID  string
+	endpointKey string
+	models      []providermodeldiscovery.Model
+	err         error
 }
 
 // ollamaContextWindowDiscoveredMsg carries the result of an async /api/show
@@ -827,10 +1029,18 @@ func (m model) applyModelPickerModelsDiscovered(msg modelPickerModelsDiscoveredM
 	if msg.err != nil || len(msg.models) == 0 {
 		return m
 	}
-	if m.modelPickerLiveByProvider == nil {
-		m.modelPickerLiveByProvider = map[string][]providermodeldiscovery.Model{}
+	newMap := make(map[string][]providermodeldiscovery.Model, len(m.modelPickerLiveByProvider)+2)
+	for k, v := range m.modelPickerLiveByProvider {
+		newMap[k] = v
 	}
-	m.modelPickerLiveByProvider[msg.providerID] = append([]providermodeldiscovery.Model{}, msg.models...)
+	modelsCopy := append([]providermodeldiscovery.Model{}, msg.models...)
+	if msg.endpointKey != "" {
+		newMap[msg.endpointKey] = modelsCopy
+	}
+	if msg.providerID != "" && (!genericProviderCatalogID(msg.providerID) || msg.endpointKey == "") {
+		newMap[msg.providerID] = modelsCopy
+	}
+	m.modelPickerLiveByProvider = newMap
 	// Rebuild the open picker so this provider's section shows its live models,
 	// preserving the current query + selection.
 	if m.picker != nil && m.picker.kind == pickerModel {
@@ -899,6 +1109,23 @@ func (m model) persistFavoriteModels() error {
 // of the session. Returns the receiver unchanged (no re-normalization, no
 // write) when every pair has a blank model id.
 func (m model) recordRecentModels(pairs ...config.RecentModelEntry) model {
+	m, changed := m.updateRecentModels(pairs...)
+	if !changed {
+		return m
+	}
+	if path := strings.TrimSpace(m.userConfigPath); path != "" {
+		if _, err := config.SetRecentModels(path, m.recentModels); err != nil {
+			m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendError, text: "recent model save error: " + err.Error()})
+		}
+	}
+	return m
+}
+
+// updateRecentModels performs recordRecentModels' in-memory half. A model
+// switch whose selection transaction failed still belongs in this session's
+// picker history, but must not make another blocking persistence attempt while
+// the same config lock is unavailable.
+func (m model) updateRecentModels(pairs ...config.RecentModelEntry) (model, bool) {
 	entries := append([]config.RecentModelEntry{}, m.recentModels...)
 	changed := false
 	for _, pair := range pairs {
@@ -910,15 +1137,10 @@ func (m model) recordRecentModels(pairs ...config.RecentModelEntry) model {
 		entries = append([]config.RecentModelEntry{{Provider: strings.TrimSpace(pair.Provider), Model: modelID}}, entries...)
 	}
 	if !changed {
-		return m
+		return m, false
 	}
 	m.recentModels = normalizeRecentModelEntries(entries)
-	if path := strings.TrimSpace(m.userConfigPath); path != "" {
-		if _, err := config.SetRecentModels(path, m.recentModels); err != nil {
-			m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendError, text: "recent model save error: " + err.Error()})
-		}
-	}
-	return m
+	return m, true
 }
 
 // normalizeRecentModelEntries trims, drops entries with no model id,
@@ -996,43 +1218,79 @@ func (m model) newEffortPicker() *commandPicker {
 	return &commandPicker{kind: pickerEffort, title: "select reasoning effort", items: items, selected: selected}
 }
 
-// newThemePicker lists `auto` plus every registered theme as a popup, grouped into
-// Dark/Light sections (the registry is ordered dark-then-light so the group header
-// changes exactly once), preselecting the active preference. Bare `/theme` opens the
-// same overlay /model and /effort use. Moving the cursor live-previews each palette
-// (previewSelectedTheme); Enter commits the highlighted theme (choosePicker) and Esc
-// restores the previous one (Update's picker-cancel path). Items stay 1:1 with
-// themeModes and in the same order, so the popup and /theme state list agree.
+// newThemePicker lists the terminal-native system theme followed by named palettes
+// in one flat list. Old dark/light preferences migrate to System rather than
+// appearing as choices: they would imply a terminal-canvas change that Zero
+// deliberately does not make.
 func (m model) newThemePicker() *commandPicker {
 	items := make([]pickerItem, 0, len(themeModes))
 	selected := 0
-	// `auto` sits at the top with an empty Group, so it renders header-less above
-	// the Dark/Light sections.
-	items = append(items, pickerItem{Label: string(themeAuto), Value: string(themeAuto), Meta: "match terminal"})
-	for _, entry := range themeRegistry {
-		group := "Light"
-		if entry.IsDark {
-			group = "Dark"
+	for _, name := range themeModes {
+		item := pickerItem{Label: name, Value: name}
+		if name == string(themeSystem) {
+			item.Label = "System"
+		} else if entry, ok := lookupTheme(name); ok {
+			item.Label = entry.Label
 		}
-		items = append(items, pickerItem{Group: group, Label: entry.Label, Value: entry.Name})
-		if entry.Name == string(m.themeMode) {
+		items = append(items, item)
+		if name == string(m.themeMode) {
 			selected = len(items) - 1
 		}
 	}
 	// allItems lets the query filter restore rows on Backspace (one-way narrowing
 	// otherwise, since applyQuery falls back to the current items without it).
-	return &commandPicker{kind: pickerTheme, title: "select theme", items: items, allItems: append([]pickerItem{}, items...), selected: selected}
+	return &commandPicker{kind: pickerTheme, title: "Choose a theme", items: items, allItems: append([]pickerItem{}, items...), selected: selected}
 }
 
-// pickerMoved advances the open picker's cursor by delta and live-previews the new
-// selection where the picker supports it — stepping through the /theme popup
-// repaints the UI in the hovered palette. Safe to call with no picker open. Callers
-// mutate through m.picker (a pointer) and the global theme, so the value receiver
-// is fine.
-func (m model) pickerMoved(delta int) {
+// newNotifyPicker lists the FULL (mode, focus) space from notifyPickerChoices
+// (every valid pair has a row, so a setting like (off, always) is always
+// preselectable and Enter can never silently commit a different pair). Each
+// row's Value is the same synthetic string the text /notify handler accepts
+// ("<mode> <focus>"), so /notify with no arg and the picker share one commit
+// path through handleNotifyCommand. Preselection uses the LIVE session pair
+// (m.notifyMode/m.notifyFocusMode, initialized from the resolved config) — not
+// the stored file, which can disagree when a project config overrides notify
+// for this session. Blank live fields resolve to their effective defaults for
+// preselection only; committing a row is an explicit choice and persists that
+// pair. There is no live preview — notify affects the next notification, not
+// the current view.
+func (m model) newNotifyPicker() *commandPicker {
+	choices := notifyPickerChoices()
+	items := make([]pickerItem, 0, len(choices))
+	selected := 0
+	activeMode := m.notifyMode
+	if strings.TrimSpace(activeMode) == "" {
+		activeMode = string(notify.ModeBoth)
+	}
+	activeFocus := m.notifyFocusMode
+	if strings.TrimSpace(activeFocus) == "" {
+		activeFocus = string(notify.FocusUnfocused)
+	}
+	for _, c := range choices {
+		items = append(items, pickerItem{
+			Group: "When Zero needs your input",
+			Label: c.label,
+			Value: c.mode + " " + c.focusMode,
+			Meta:  c.subtitle(),
+		})
+		if c.mode == activeMode && c.focusMode == activeFocus {
+			selected = len(items) - 1
+		}
+	}
+	return &commandPicker{kind: pickerNotify, title: "select notify mode", items: items, allItems: append([]pickerItem{}, items...), selected: selected}
+}
+
+// pickerMoved advances the open picker's cursor by delta. Theme candidates render
+// only in the picker preview; their active palette is applied only after Enter.
+// Safe to call with no picker open. Callers mutate through m.picker (a pointer),
+// so the value receiver is fine.
+func (m model) pickerMoved(delta int) (model, tea.Cmd) {
 	if m.picker == nil {
-		return
+		return m, nil
 	}
 	m.picker.move(delta)
-	m.previewSelectedTheme()
+	if m.picker.kind == pickerPet {
+		return m.schedulePetPreview()
+	}
+	return m, nil
 }

@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 func TestMeasureContextSplitsByCategory(t *testing.T) {
@@ -31,6 +31,9 @@ func TestMeasureContextSplitsByCategory(t *testing.T) {
 	wantFraction := float64(breakdown.TotalTokens) / 100_000
 	if breakdown.UsedFraction != wantFraction {
 		t.Fatalf("UsedFraction = %v, want %v", breakdown.UsedFraction, wantFraction)
+	}
+	if len(breakdown.Blocks) != 3 {
+		t.Fatalf("Blocks = %#v, want system/tools/conversation", breakdown.Blocks)
 	}
 }
 

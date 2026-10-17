@@ -6,16 +6,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/colorprofile"
 
-	"github.com/Gitlawb/zero/internal/agent"
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/sandbox"
-	"github.com/Gitlawb/zero/internal/streamjson"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/agent"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/streamjson"
+	"github.com/Twigpine/zero/internal/tools"
 )
 
 // ansiPattern strips SGR styling and OSC sequences (hyperlinks) so
@@ -52,18 +53,32 @@ func TestStyleAssistantMarkdownLinePassesAnsiVerbatim(t *testing.T) {
 	}
 }
 
-// update_plan and Task render as a dedicated UI (plan panel / specialist card),
-// so their transcript tool cards are suppressed; everything else still shows.
-func TestToolCardSuppressedInTranscript(t *testing.T) {
-	for _, name := range []string{"Task", "update_plan"} {
-		if !toolCardSuppressedInTranscript(name) {
-			t.Errorf("%q should be suppressed from the transcript (shown by a dedicated UI)", name)
+// Task and TaskOutput render through specialist cards. update_plan hides only
+// while in flight; its successful result is the durable transcript checklist.
+func TestToolCallCardSuppressedInTranscript(t *testing.T) {
+	for _, name := range []string{"Task", "update_plan", "TaskOutput", "tool_search"} {
+		if !toolCallCardSuppressedInTranscript(name) {
+			t.Errorf("%q call should be suppressed from the transcript", name)
 		}
 	}
 	for _, name := range []string{"read_file", "write_file", "edit_file", "bash", "swarm_spawn"} {
-		if toolCardSuppressedInTranscript(name) {
+		if toolCallCardSuppressedInTranscript(name) {
 			t.Errorf("%q must still show its transcript card", name)
 		}
+	}
+}
+
+func TestSuppressedToolFailuresRemainVisible(t *testing.T) {
+	for _, name := range []string{"Task", "TaskOutput", "tool_search"} {
+		if !toolResultCardSuppressedInTranscript(name, tools.StatusOK) {
+			t.Errorf("successful %q result should be suppressed", name)
+		}
+		if toolResultCardSuppressedInTranscript(name, tools.StatusError) {
+			t.Errorf("failed %q result must remain visible", name)
+		}
+	}
+	if toolResultCardSuppressedInTranscript("update_plan", tools.StatusOK) {
+		t.Error("successful update_plan result must render as a transcript checklist")
 	}
 }
 
@@ -73,6 +88,64 @@ func TestUserRowRendersPromptGutter(t *testing.T) {
 	got := plainRender(t, m.renderRow(row, 96, buildRowContext(nil)))
 	if !strings.Contains(got, "\n▌  add a --version flag") {
 		t.Fatalf("user row = %q, want rail-prefixed text", got)
+	}
+}
+
+func TestRunningToolCardUsesLiveRailOnlyForActiveRun(t *testing.T) {
+	m := limeTestModel()
+	m.pending = true
+	m.activeRunID = 4
+	row := transcriptRow{kind: rowToolCall, id: "call-1", runID: 4, tool: "read_file", detail: "main.go"}
+	active := plainRender(t, m.renderRunningToolCard(row, 80, buildRowContext([]transcriptRow{row}), cardRenderOptions{}))
+	if !strings.HasPrefix(active, "│ ") {
+		t.Fatalf("active card should begin with a live rail, got %q", active)
+	}
+	if !strings.Contains(active, "Reading") {
+		t.Fatalf("active card should retain its action label, got %q", active)
+	}
+
+	m.pending = false
+	inactive := plainRender(t, m.renderRunningToolCard(row, 80, buildRowContext([]transcriptRow{row}), cardRenderOptions{}))
+	if strings.HasPrefix(inactive, "│ ") {
+		t.Fatalf("inactive card should not retain a live rail, got %q", inactive)
+	}
+
+	m.pending = true
+	stale := row
+	stale.runID = m.activeRunID + 1
+	staleCard := plainRender(t, m.renderRunningToolCard(stale, 80, buildRowContext([]transcriptRow{stale}), cardRenderOptions{}))
+	if strings.HasPrefix(staleCard, "│ ") {
+		t.Fatalf("a stale run card should not receive a live rail, got %q", staleCard)
+	}
+}
+
+func TestAskUserQuestionnaireNamesWaitingForAnswer(t *testing.T) {
+	prompt := pendingAskUserPrompt{
+		request: agent.AskUserRequest{
+			Header: "Quick question",
+			Questions: []agent.AskUserQuestion{{
+				Question: "Which task should Zero handle first?",
+				Options:  []string{"Work helper"},
+			}},
+		},
+		states: newAskUserStates([]agent.AskUserQuestion{{
+			Question: "Which task should Zero handle first?",
+			Options:  []string{"Work helper"},
+		}}),
+	}
+	got := plainRender(t, renderAskUserQuestionnaire(prompt, "", 80))
+	for _, want := range []string{"Quick question", "waiting for your answer"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("questionnaire missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestAskUserWaitingStateFitsNarrowCardWithoutTitle(t *testing.T) {
+	const width = 12
+	got := renderAskUserWaitingState("", width, func(style lipgloss.Style) lipgloss.Style { return style })
+	if visible := lipgloss.Width(got); visible > width-4 {
+		t.Fatalf("waiting state width = %d, want at most %d: %q", visible, width-4, plainRender(t, got))
 	}
 }
 
@@ -975,10 +1048,36 @@ func TestEditedDiffCardHidesHunkHeader(t *testing.T) {
 	}
 }
 
+func TestEditedDiffCardHandlesBareBlankHunkContext(t *testing.T) {
+	m := limeTestModel()
+	diff := strings.Join([]string{
+		"--- a/time_test.py",
+		"+++ b/time_test.py",
+		"@@ -1,3 +1,3 @@",
+		" from datetime import datetime",
+		"",
+		"-print(datetime.now())",
+		"+print(f\"Current time: {datetime.now()}\")",
+	}, "\n")
+	row := transcriptRow{kind: rowToolResult, id: "call_1", tool: "edit_file", status: tools.StatusOK, detail: diff}
+	got := plainRender(t, m.renderRow(row, 96, buildRowContext(nil)))
+	for _, want := range []string{"Edited", "time_test.py", "(+1 -1)", "from datetime import datetime", "   3 −", "   3 +"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("edited diff card = %q, missing %q", got, want)
+		}
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.TrimSpace(line) == "2" {
+			return
+		}
+	}
+	t.Fatalf("edited diff card = %q, missing blank context line 2", got)
+}
+
 func TestReadCardBodyShowsExploredSummary(t *testing.T) {
 	m := limeTestModel()
-	// Mirrors the real read_file output shape: "<right-aligned N> | <text>".
-	detail := "File: internal/agent/loop.go\n\n  12 | func Run() {\n  13 | }\n"
+	// Mirrors the real read_file output shape: "N→<text>".
+	detail := "File: internal/agent/loop.go\n\n12→func Run() {\n13→}\n"
 	row := transcriptRow{kind: rowToolResult, id: "call_1", tool: "read_file", status: tools.StatusOK, detail: detail}
 	rc := buildRowContext([]transcriptRow{{kind: rowToolCall, id: "call_1", tool: "read_file", detail: "internal/agent/loop.go"}})
 	got := plainRender(t, m.renderRow(row, 80, rc))
@@ -999,7 +1098,7 @@ func TestReadCardBodyShowsExploredSummary(t *testing.T) {
 
 	row.expanded = true
 	expanded := plainRender(t, m.renderRow(row, 80, rc))
-	for _, want := range []string{"Explored", "└ Read", "internal/agent/loop.go", "func Run()", "13 |"} {
+	for _, want := range []string{"Explored", "└ Read", "internal/agent/loop.go", "func Run()", "13→"} {
 		if !strings.Contains(expanded, want) {
 			t.Fatalf("expanded read card = %q, missing %q", expanded, want)
 		}
@@ -1051,6 +1150,20 @@ func TestToolCardHeadCollapsesMultilineCommand(t *testing.T) {
 	}
 	if !strings.Contains(got, "Ran node -e") || !strings.Contains(got, "const fs = require") {
 		t.Fatalf("multi-line command summary should stay visible on one line, got:\n%s", got)
+	}
+}
+
+func TestToolCardHeadStylesShellCommandButNotCommandOutput(t *testing.T) {
+	previous := zeroTheme
+	defer func() { zeroTheme = previous }()
+	_, zeroTheme = themeForMode("nord", true)
+
+	head := toolCardHead("bash", "gofmt -w calculator.go && go run . divide 9 2", "", "", "", "", false, zeroTheme.green, false, 120, cardRenderOptions{})
+	if !strings.Contains(head, "\x1b[") {
+		t.Fatalf("shell command head should be styled, got %q", head)
+	}
+	if plain := ansiPattern.ReplaceAllString(head, ""); !strings.Contains(plain, "Ran gofmt -w calculator.go && go run . divide 9 2") {
+		t.Fatalf("shell command head changed visible text to %q", plain)
 	}
 }
 
@@ -1659,7 +1772,7 @@ func TestFocusedPermissionCardShowsBadgeAndKeys(t *testing.T) {
 		Risk:               sandbox.Risk{Level: sandbox.RiskMedium},
 		AvailableDecisions: testAllPermissionDecisions(),
 	}
-	card, offsets := renderFocusedPermissionPrompt(request, 0, 80)
+	card, offsets := renderFocusedPermissionPrompt(request, 0, false, "", 80)
 	got := plainRender(t, card)
 	for _, want := range []string{"PERMISSION", "edit_file", "writes internal/agent/exec.go", "Yes, proceed", "[a]", "this session", "[s]", "don't ask again", "[y]", "continue without running it", "[d]", "[esc]"} {
 		if !strings.Contains(got, want) {
@@ -1781,10 +1894,100 @@ func TestModelPickerRowsCarryCapabilityMeta(t *testing.T) {
 	}
 }
 
+func TestModelPickerRowShowsOwnerInMixedGroups(t *testing.T) {
+	for _, group := range []string{"Recent", "Favorites"} {
+		for _, owner := range []string{"chatgpt", "openai", "work-openai"} {
+			for _, selected := range []bool{false, true} {
+				item := pickerItem{Group: group, Label: "GPT-5.6", Value: "gpt-5.6", Provider: "openai", OwnerProvider: owner, OwnerLabel: owner, Favorite: group == "Favorites"}
+				want := owner + " · GPT-5.6"
+				if item.Favorite {
+					want = "* " + want
+				}
+				got := plainRender(t, renderModelPickerRow(60, selected, item))
+				if !strings.Contains(got, want) {
+					t.Errorf("group=%s selected=%v: row = %q, want %q", group, selected, got, want)
+				}
+			}
+		}
+	}
+	item := pickerItem{Group: "Recent", Value: "custom-model"}
+	if got := strings.TrimSpace(plainRender(t, renderModelPickerRow(60, false, item))); got != "custom-model" {
+		t.Fatalf("ownerless fallback row = %q", got)
+	}
+}
+
+func TestModelPickerWidthIncludesOwner(t *testing.T) {
+	item := pickerItem{Group: "Recent", Label: strings.Repeat("m", 40), OwnerProvider: "subscription-profile", OwnerLabel: "subscription-profile", Favorite: true}
+	picker := &commandPicker{items: []pickerItem{item}}
+	width := modelPickerOverlayWidth(120, picker)
+	got := plainRender(t, renderModelPickerRow(width-4, false, item))
+	if want := "* subscription-profile · " + item.Label; !strings.Contains(got, want) {
+		t.Fatalf("row clipped at overlay width %d: %q, want %q", width, got, want)
+	}
+}
+
+// Profile names are unbounded; a long owner must not consume the model name
+// once the overlay reaches its maximum width.
+func TestModelPickerLongOwnerKeepsModelVisible(t *testing.T) {
+	owner := strings.Repeat("o", 70)
+	for _, group := range []string{"Recent", "Favorites"} {
+		for _, label := range []string{"GPT-5.6", strings.Repeat("m", 40)} {
+			item := pickerItem{Group: group, Label: label, Value: label, OwnerProvider: owner, OwnerLabel: owner, Favorite: group == "Favorites"}
+			wide := pickerItem{Group: "Recent", Label: strings.Repeat("w", 100)}
+			width := modelPickerOverlayWidth(200, &commandPicker{items: []pickerItem{item, wide}})
+			if width != modelPickerOverlayMaxWidth {
+				t.Fatalf("overlay width = %d, want the %d cap", width, modelPickerOverlayMaxWidth)
+			}
+			got := plainRender(t, renderModelPickerRow(width-4, false, item))
+			want := "…" + strings.Repeat("o", 19) + " · " + label
+			if !strings.Contains(got, want) || !strings.Contains(want, "…") {
+				t.Fatalf("group=%s: row = %q, want %q with the owner capped", group, got, want)
+			}
+		}
+	}
+}
+
+func TestModelPickerNarrowOwnerKeepsModelVisible(t *testing.T) {
+	for _, favorite := range []bool{false, true} {
+		for _, selected := range []bool{false, true} {
+			item := pickerItem{Label: "GPT-5.6", OwnerLabel: "subscription-profile", Favorite: favorite}
+			width := modelPickerOverlayWidth(30, &commandPicker{items: []pickerItem{item}})
+			got := plainRender(t, renderModelPickerRow(width-4, selected, item))
+			assertContains(t, got, "GPT-5.6")
+			assertContains(t, got, "profile · ")
+		}
+	}
+}
+
+func TestModelPickerNarrowLongModelKeepsSuffix(t *testing.T) {
+	for _, favorite := range []bool{false, true} {
+		for _, selected := range []bool{false, true} {
+			for _, label := range []string{"model-subscription-one", "model-subscription-two"} {
+				item := pickerItem{Label: label, OwnerLabel: "subscription-profile", OwnerNumber: 1, Favorite: favorite}
+				got := plainRender(t, renderModelPickerRow(26, selected, item))
+				assertContains(t, got, label)
+				assertContains(t, got, "subscription-profile")
+				if len(strings.Split(got, "\n")) != 2 {
+					t.Fatalf("expected separate model and owner lines: %q", got)
+				}
+			}
+		}
+	}
+}
+
+func TestModelPickerClippedModelCannotHideOwnerKey(t *testing.T) {
+	m := limeTestModel()
+	item := pickerItem{Group: "Recent", Label: strings.Repeat("model-", 10) + "work-subscription-profile", OwnerLabel: "work-subscription-profile", OwnerNumber: 1}
+	m.picker = &commandPicker{kind: pickerModel, items: []pickerItem{item}}
+	got := plainRender(t, m.modelPickerOverlay(30))
+	joined := strings.NewReplacer(" ", "", "\n", "", "│", "").Replace(got)
+	assertContains(t, joined, "[1]work-subscription-profile")
+}
+
 func TestModelPickerRowOmitsProviderTag(t *testing.T) {
 	// The provider is shown as a section header above each group, so a row renders
 	// just the model label — no repeated right-aligned provider tag.
-	item := pickerItem{Label: "Claude Sonnet 4.6", Value: "claude-sonnet-4-6", Provider: "anthropic", Remote: true}
+	item := pickerItem{Group: "anthropic", Label: "Claude Sonnet 4.6", Value: "claude-sonnet-4-6", Provider: "anthropic", OwnerProvider: "anthropic", Remote: true}
 	got := plainRender(t, renderModelPickerRow(60, false, item))
 	if !strings.Contains(got, "Claude Sonnet 4.6") {
 		t.Fatalf("row = %q, missing model label", got)
@@ -1861,59 +2064,43 @@ func TestPermissionCollapseIsRunScoped(t *testing.T) {
 }
 
 func TestSessionsCardFieldsAreSanitized(t *testing.T) {
-	if got := sanitizeCardField("evil\x1ftitle\nwith\x00bytes"); strings.ContainsAny(got, "\x1f\n\x00") {
-		t.Fatalf("sanitizeCardField left separator bytes: %q", got)
+	inputs := []string{
+		"evil\x1ftitle",
+		"line\nbreak",
+		"line\rbreak",
+		"nul\x00byte",
+		"esc\x1b[31mred",
+		"csi\x1b[2J\x1b[H",
+		"osc\x1b]0;pwned\a",
+		"bell\aring",
+		"back\bspace",
+		"tab\there",
+		"vert\vtab",
+		"nel\u0085here",
+	}
+	for _, input := range inputs {
+		got := sanitizeCardField(input)
+		for _, r := range got {
+			if unicode.IsControl(r) {
+				t.Fatalf("sanitizeCardField(%q) left control rune %q in %q", input, r, got)
+			}
+		}
 	}
 }
 
-func TestComposerDescriptionHintRendersForSingleSlashMatch(t *testing.T) {
-	// When the user has typed a slash command that matches exactly one entry in
-	// the command palette, the composer hint line should surface that command's
-	// description below the box, claude-code style.
+func TestCommandPaletteKeepsDescriptionInsideOverlay(t *testing.T) {
 	m := limeTestModel()
 	m.input.SetValue("/effort")
 	m.recomputeSuggestions()
 	if !m.commandPaletteOpen || len(m.suggestions) != 1 || m.suggestions[0].Name != "/effort" {
 		t.Fatalf("setup: expected a single /effort suggestion, got palette=%v matches=%#v", m.commandPaletteOpen, m.suggestions)
 	}
-	got := plainRender(t, m.composerDescriptionHint(96))
-	if !strings.Contains(got, "reasoning effort") {
-		t.Fatalf("description hint = %q, want it to mention reasoning effort", got)
+	overlay := plainRender(t, m.suggestionOverlay(96))
+	if !strings.Contains(overlay, "reasoning effort") {
+		t.Fatalf("palette description = %q", overlay)
 	}
-}
-
-func TestComposerDescriptionHintStaysEmptyForAmbiguousPrefix(t *testing.T) {
-	// A prefix that still matches multiple commands should not surface a hint --
-	// the dropdown is the right affordance for an ambiguous match.
-	m := limeTestModel()
-	m.input.SetValue("/")
-	m.recomputeSuggestions()
-	if !m.commandPaletteOpen || len(m.suggestions) < 2 {
-		t.Fatalf("setup: expected multiple suggestions for bare '/', got palette=%v matches=%d", m.commandPaletteOpen, len(m.suggestions))
-	}
-	if got := m.composerDescriptionHint(96); got != "" {
-		t.Fatalf("description hint should be empty for ambiguous matches, got %q", got)
-	}
-}
-
-func TestComposerDescriptionHintStaysEmptyAfterArgs(t *testing.T) {
-	// Once the user starts typing arguments, the palette narrows off and we
-	// shouldn't keep advertising the command's description.
-	m := limeTestModel()
-	m.input.SetValue("/effort high")
-	m.recomputeSuggestions()
-	if got := m.composerDescriptionHint(96); got != "" {
-		t.Fatalf("description hint should be empty after args, got %q", got)
-	}
-}
-
-func TestComposerDescriptionHintStaysEmptyForFilePalette(t *testing.T) {
-	// The @file palette already renders its rows; the description hint is
-	// scoped to slash commands.
-	m := limeTestModel()
-	m.input.SetValue("@")
-	m.recomputeSuggestions()
-	if got := m.composerDescriptionHint(96); got != "" {
-		t.Fatalf("description hint should be empty for file palette, got %q", got)
+	footer := plainRender(t, m.footerView(96))
+	if strings.Contains(footer, "reasoning effort") {
+		t.Fatalf("composer footer duplicated palette description: %q", footer)
 	}
 }

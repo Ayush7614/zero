@@ -11,11 +11,16 @@ import (
 )
 
 var (
-	applyUnixSocketBlockFilter  = ApplyUnixSocketBlock
-	applyLinuxNetworkDenyFilter = ApplyLinuxNetworkDeny
+	applyUnixSocketBlockFilter           = ApplyUnixSocketBlock
+	applyLinuxIsolatedNetworkGuardFilter = ApplyLinuxIsolatedNetworkGuard
 )
 
 func RunLinuxSandboxHelper(args []string, stderr io.Writer) int {
+	selfExec := false
+	if len(args) > 0 && args[0] == LinuxSandboxHelperSubcommand {
+		selfExec = true
+		args = args[1:]
+	}
 	config, err := ParseLinuxSandboxHelperArgs(args)
 	if err != nil {
 		fmt.Fprintln(stderr, LinuxSandboxHelperName+": "+err.Error())
@@ -32,9 +37,10 @@ func RunLinuxSandboxHelper(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, LinuxSandboxHelperName+": resolve helper path: "+err.Error())
 		return 125
 	}
-	bwrapArgs, err := BuildLinuxSandboxBwrapArgs(LinuxSandboxBwrapOptions{
+	bwrapPlan, err := buildLinuxSandboxBwrapPlan(LinuxSandboxBwrapOptions{
 		Config:     config,
 		HelperPath: helperPath,
+		SelfExec:   selfExec,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, LinuxSandboxHelperName+": "+err.Error())
@@ -45,7 +51,10 @@ func RunLinuxSandboxHelper(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, LinuxSandboxHelperName+": bubblewrap is not available: "+err.Error())
 		return 125
 	}
-	if err := syscall.Exec(bwrapPath, append([]string{"bwrap"}, bwrapArgs...), os.Environ()); err != nil {
+	if len(bwrapPlan.ProtectedCreateTargets) > 0 {
+		return runLinuxSandboxWithProtectedCreateMonitor(bwrapPath, bwrapPlan, config.PolicyReportPath, stderr)
+	}
+	if err := syscall.Exec(bwrapPath, append([]string{"bwrap"}, bwrapPlan.Args...), os.Environ()); err != nil {
 		fmt.Fprintln(stderr, LinuxSandboxHelperName+": exec bubblewrap: "+err.Error())
 		return 126
 	}
@@ -69,9 +78,14 @@ func runLinuxSandboxInnerStage(config LinuxSandboxHelperConfig, stderr io.Writer
 		fmt.Fprintln(stderr, LinuxSandboxHelperName+": inner seccomp stage is incompatible with Landlock mode")
 		return 2
 	}
+	// The outer bubblewrap stage already enforces NetworkDeny with a private
+	// network namespace. Do not install the broad seccomp network filter here:
+	// it would also block AF_INET/AF_INET6 sockets inside that namespace and
+	// break isolated localhost test servers. The namespace has loopback only,
+	// so local bind/connect works while external egress remains unreachable.
 	if shouldUnshareLinuxNetwork(config.PermissionProfile.Network) {
-		if err := applyLinuxNetworkDenyFilter(); err != nil {
-			fmt.Fprintln(stderr, LinuxSandboxHelperName+": apply network deny: "+err.Error())
+		if err := applyLinuxIsolatedNetworkGuardFilter(); err != nil {
+			fmt.Fprintln(stderr, LinuxSandboxHelperName+": apply isolated network guard: "+err.Error())
 			return 125
 		}
 	}

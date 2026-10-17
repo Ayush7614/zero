@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/agenteval"
+	"github.com/Twigpine/zero/internal/agenteval"
 )
 
 type agentEvalOptions struct {
@@ -515,9 +515,7 @@ func agentEvalReportFromBenchmark(suite agenteval.Suite, report agenteval.Benchm
 		if task.Agent.Truncated {
 			converted.Truncated = true
 		}
-		for _, failure := range agentEvalFailuresFromTaskReport(task) {
-			converted.Failures = append(converted.Failures, failure)
-		}
+		converted.Failures = append(converted.Failures, agentEvalFailuresFromTaskReport(task)...)
 	}
 	return converted
 }

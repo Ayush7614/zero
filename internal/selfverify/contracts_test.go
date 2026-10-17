@@ -4,12 +4,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/testrunner"
-	"github.com/Gitlawb/zero/internal/verify"
+	"github.com/Twigpine/zero/internal/testrunner"
+	"github.com/Twigpine/zero/internal/verify"
 )
 
 func TestSnapshotFromReportPreservesAttemptsAndRedactsRemediation(t *testing.T) {
-	secret := "sk-proj-abcdefghijklmnopqrstuvwxyz"
+	secret := "sk-proj-abcdefghijklmnopqrstuvwxyz0"
 	report := Report{
 		Root:       "/repo/" + secret,
 		StartedAt:  "2026-06-06T11:00:00Z",

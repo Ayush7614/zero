@@ -3,25 +3,31 @@ package providermodelcatalog
 import (
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/providercatalog"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/providercatalog"
 )
 
 type Model struct {
-	ID               string
-	Description      string
-	ContextWindow    int
-	ToolCall         bool
-	Reasoning        bool
-	InputModalities  []string
-	OutputModalities []string
-	InputCost        float64
-	OutputCost       float64
-	Tags             []string
-	Source           string
+	ID                     string
+	Description            string
+	ContextWindow          int
+	ToolCall               bool
+	Reasoning              bool
+	ReasoningEfforts       []string
+	DefaultReasoningEffort string
+	ServiceTiers           []string
+	DefaultServiceTier     string
+	InputModalities        []string
+	OutputModalities       []string
+	InputCost              float64
+	OutputCost             float64
+	Tags                   []string
+	Source                 string
 }
 
 const minimaxModelSource = "https://platform.minimax.io/docs/api-reference/api-overview"
+
+const concentrateModelSource = "https://api.concentrate.ai/v1/models"
 
 // Shared by both "minimax" and "minimaxi-cn"; Models() rebuilds a fresh slice
 // per call, so the shared backing slice cannot be mutated by callers.
@@ -61,6 +67,17 @@ var zaiCuratedModels = []Model{
 }
 
 var curatedModels = map[string][]Model{
+	// aimlapi.com aggregates every upstream provider behind one OpenAI-compatible
+	// endpoint, so the curated defaults are a cross-provider "best of" flagship
+	// list. The live /v1/models discovery (when a key is present) replaces this;
+	// these are the offline/pre-key fallback and the picker's default order.
+	"aimlapi": {
+		{ID: "anthropic/claude-sonnet-5", Description: "catalog default (Anthropic Claude Sonnet 5)"},
+		{ID: "google/gemini-3.5-flash", Description: "Google Gemini Flash 3.5"},
+		{ID: "openai/gpt-5.5-2026-04-23", Description: "OpenAI GPT-5.5"},
+		{ID: "qwen/qwen-3.7-max", Description: "Qwen 3.7 Max"},
+		{ID: "deepseek/deepseek-v4-pro", Description: "DeepSeek V4"},
+	},
 	"ollama-cloud": {
 		{ID: "qwen3-coder:480b", Description: "catalog default"},
 		{ID: "gpt-oss:120b", Description: "agentic coding model"},
@@ -111,6 +128,14 @@ var curatedModels = map[string][]Model{
 		{ID: "deepseek-ai/DeepSeek-R1", Description: "reasoning model"},
 		{ID: "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8", Description: "multimodal model"},
 	},
+	"fireworks": {
+		// Serverless-only curated set: ordinary API-key setups hit /inference/v1
+		// and cannot use on-demand deployment IDs.
+		{ID: "accounts/fireworks/models/kimi-k2p7-code", Description: "catalog default"},
+		{ID: "accounts/fireworks/models/deepseek-v4-flash", Description: "fast coding model"},
+		{ID: "accounts/fireworks/models/gpt-oss-120b", Description: "general model"},
+		{ID: "accounts/fireworks/models/deepseek-v4-pro", Description: "reasoning model"},
+	},
 	"dashscope": {
 		{ID: "qwen-plus", Description: "catalog default"},
 		{ID: "qwen-max", Description: "strong general model"},
@@ -121,6 +146,28 @@ var curatedModels = map[string][]Model{
 		{ID: "kimi-k2-0905-preview", Description: "catalog default"},
 		{ID: "kimi-k2-turbo-preview", Description: "fast coding model"},
 		{ID: "moonshot-v1-128k", Description: "long-context model"},
+	},
+	"atlascloud": {
+		{ID: "qwen/qwen3.5-flash", Description: "catalog default"},
+		{ID: "deepseek-ai/deepseek-v4-pro", Description: "reasoning model"},
+	},
+	"gmicloud": {
+		{ID: "Qwen/Qwen3.8-Max", Description: "catalog default"},
+		{ID: "Qwen/Qwen3.8-Flash", Description: "fast model"},
+		{ID: "deepseek-ai/DeepSeek-V4-Pro", Description: "reasoning model"},
+		{ID: "deepseek-ai/DeepSeek-V4-Flash", Description: "fast coding model"},
+	},
+	// Context windows, tool calling and thinking support come from
+	// concentrateModelSource (max_input_tokens, function_calling, thinking).
+	// Max output: 393,216 for both DeepSeek V4 models, 262,144 for Kimi K3 and
+	// GLM-5.3. The default is the dated id deepseek-v4-flash-0731, the model
+	// behind the deepseek-v4-flash alias (OpenClaude's Concentrate default): the
+	// live list carries ids only, so an alias would not survive discovery.
+	"concentrate": {
+		{ID: "deepseek-v4-flash-0731", Description: "catalog default", ContextWindow: 1_048_576, ToolCall: true, Reasoning: true, Source: concentrateModelSource},
+		{ID: "deepseek-v4-pro", Description: "reasoning model", ContextWindow: 1_048_576, ToolCall: true, Reasoning: true, Source: concentrateModelSource},
+		{ID: "kimi-k3", Description: "coding model", ContextWindow: 1_048_576, ToolCall: true, Reasoning: true, Source: concentrateModelSource},
+		{ID: "glm-5.3", Description: "coding model", ContextWindow: 1_048_576, ToolCall: true, Reasoning: true, Source: concentrateModelSource},
 	},
 	"nvidia-nim": {
 		{ID: "nvidia/llama-3.1-nemotron-70b-instruct", Description: "catalog default"},
@@ -187,6 +234,8 @@ var curatedModels = map[string][]Model{
 		{ID: "gpt-4.1", Description: "catalog default"},
 		{ID: "gpt-4o-mini", Description: "fast model"},
 	},
+	// atomic-chat-local has no curated list: discover the user-loaded model
+	// from the runtime's /v1/models endpoint.
 	"opencode-go-anthropic-compatible": {
 		{ID: "minimax-m3", Description: "MiniMax M3: default"},
 		{ID: "minimax-m2.7", Description: "MiniMax M2.7: coding model"},
@@ -247,6 +296,8 @@ func dedupeModels(defaultModel string, models []Model) []Model {
 		}
 		model.InputModalities = append([]string{}, model.InputModalities...)
 		model.OutputModalities = append([]string{}, model.OutputModalities...)
+		model.ReasoningEfforts = append([]string{}, model.ReasoningEfforts...)
+		model.ServiceTiers = append([]string{}, model.ServiceTiers...)
 		model.Tags = append([]string{}, model.Tags...)
 		seen[model.ID] = true
 		result = append(result, model)
