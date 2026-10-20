@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"time"
 )
@@ -30,13 +31,35 @@ const (
 
 var (
 	openSecretLockFile = os.OpenFile
+	syncSecretFileFn   = (*os.File).Sync
+	syncSecretDirFn    = syncSecretDir
 	secureLockSeq      atomic.Uint64
 )
+
+// syncSecretDir fsyncs the directory that now holds the published secret.
+// Windows cannot sync directory handles, so the rename is best-effort durable
+// there. A directory the user can write but not read cannot be opened for
+// syncing either; that is also best effort, because the write it follows
+// already succeeded. Every other failure is reported.
+func syncSecretDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return nil
+		}
+		return err
+	}
+	return errors.Join(d.Sync(), d.Close())
+}
 
 // Crypter encrypts a blob at rest with AES-256-GCM under a per-user random secret
 // persisted (0600) at secretPath.
 type Crypter struct {
-	secretPath string
+	secretPath     string
+	publicationDir string
 }
 
 // NewCrypter returns a Crypter whose key lives at secretPath (created on first
@@ -45,11 +68,20 @@ func NewCrypter(secretPath string) *Crypter {
 	return &Crypter{secretPath: secretPath}
 }
 
+// NewCrypterWithPublicationDir is NewCrypter with secret temp files published
+// through publicationDir instead of beside the secret. Callers that protect a
+// sandboxed process from racing the plaintext key use this to put the temp file
+// in a directory their sandbox profile denies. The directory must be on the
+// same filesystem as secretPath; the final rename remains atomic.
+func NewCrypterWithPublicationDir(secretPath, publicationDir string) *Crypter {
+	return &Crypter{secretPath: secretPath, publicationDir: publicationDir}
+}
+
 // aead loads (or, when create is set, generates) the secret and returns the GCM
 // AEAD. Open passes create=false so a missing secret is a hard error rather than
 // silently minting a new key that could never decrypt the existing file.
 func (c *Crypter) aead(create bool) (cipher.AEAD, error) {
-	secret, err := loadOrCreateSecret(c.secretPath, create)
+	secret, err := loadOrCreateSecret(c.secretPath, c.publicationDir, create)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +127,7 @@ func (c *Crypter) Open(blob []byte) ([]byte, error) {
 // loadOrCreateSecret reads the 32-byte secret at path. When create is set and the
 // file is absent, it generates a random secret and creates the file atomically
 // (0600). A wrong-sized existing secret fails closed (corruption).
-func loadOrCreateSecret(path string, create bool) ([]byte, error) {
+func loadOrCreateSecret(path, publicationDir string, create bool) ([]byte, error) {
 	if data, err := readSecretFileRetry(path); err == nil {
 		return data, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -107,10 +139,10 @@ func loadOrCreateSecret(path string, create bool) ([]byte, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	return createSecretFile(path)
+	return createSecretFile(path, publicationDir)
 }
 
-func createSecretFile(path string) ([]byte, error) {
+func createSecretFile(path, publicationDir string) ([]byte, error) {
 	lockPath := path + ".lock"
 	token := fmt.Sprintf("%d-%d-%d", os.Getpid(), time.Now().UnixNano(), secureLockSeq.Add(1))
 	var lastErr error
@@ -136,13 +168,13 @@ func createSecretFile(path string) ([]byte, error) {
 			} else if !errors.Is(rerr, os.ErrNotExist) {
 				return nil, rerr
 			}
-			return writeNewSecretFile(path)
+			return writeNewSecretFile(path, publicationDir)
 		}
 		// On Windows a concurrent holder's os.Remove leaves the lock file in a
 		// "delete pending" state, so an O_EXCL create races it with
 		// ERROR_ACCESS_DENIED (os.ErrPermission) rather than ErrExist. Treat that
-		// as contention and retry too -- mirroring oauth's createSecretFile --
-		// otherwise concurrent secret creation spuriously fails on Windows.
+		// as contention and retry, otherwise concurrent secret creation
+		// spuriously fails on Windows.
 		if !errors.Is(err, os.ErrExist) && !errors.Is(err, os.ErrPermission) {
 			return nil, fmt.Errorf("securefile: create secret lock: %w", err)
 		}
@@ -180,13 +212,24 @@ func reclaimStaleLock(lockPath, token string, staleAfter time.Duration) bool {
 	return true
 }
 
-func writeNewSecretFile(path string) ([]byte, error) {
+func writeNewSecretFile(path, publicationDir string) ([]byte, error) {
 	secret := make([]byte, secretBytes)
 	if _, err := io.ReadFull(rand.Reader, secret); err != nil {
 		return nil, fmt.Errorf("securefile: generate secret: %w", err)
 	}
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	dir := publicationDir
+	prefix := filepath.Base(path) + ".*.tmp"
+	if dir == "" {
+		dir = filepath.Dir(path)
+	} else {
+		// Keep the prefix oauth's store reset uses to clean crash residue from a
+		// publication directory.
+		prefix = "publish-*"
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("securefile: create secret publication dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, prefix)
 	if err != nil {
 		return nil, fmt.Errorf("securefile: create secret temp file: %w", err)
 	}
@@ -200,7 +243,7 @@ func writeNewSecretFile(path string) ([]byte, error) {
 		_ = tmp.Close()
 		return nil, fmt.Errorf("securefile: write secret: %w", werr)
 	}
-	if serr := tmp.Sync(); serr != nil {
+	if serr := syncSecretFileFn(tmp); serr != nil {
 		_ = tmp.Close()
 		return nil, fmt.Errorf("securefile: sync secret: %w", serr)
 	}
@@ -209,6 +252,12 @@ func writeNewSecretFile(path string) ([]byte, error) {
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return nil, fmt.Errorf("securefile: publish secret: %w", err)
+	}
+	// The key is now visible at its final name; sync the destination directory
+	// so the rename itself survives a crash. The source publication directory
+	// only held an unlinked temp entry and does not need a barrier.
+	if err := syncSecretDirFn(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("securefile: sync secret directory: %w", err)
 	}
 	return secret, nil
 }
