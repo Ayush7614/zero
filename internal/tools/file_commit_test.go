@@ -385,9 +385,11 @@ func TestOverwriteDoesNotTruncateAHardlinkSibling(t *testing.T) {
 // carried over from the file that was observed, not from the side file the
 // bytes were staged in.
 func TestOverwriteKeepsTheObservedPermissionBits(t *testing.T) {
-	want := os.FileMode(0o600)
+	// 0o640 differs from the 0o600 the side file is staged with, so a publish
+	// that forgot to carry the observed bits cannot pass by coincidence.
+	want := os.FileMode(0o640)
 	if runtime.GOOS == "windows" {
-		// A Windows file carries only the read-only bit, so a 0o600 file is
+		// A Windows file carries only the read-only bit, so a 0o640 file is
 		// reported as 0o666; the write bit, not the exact value, is the fact
 		// being pinned.
 		want = os.FileMode(0o666)

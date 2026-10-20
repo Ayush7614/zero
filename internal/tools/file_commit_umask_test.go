@@ -13,15 +13,15 @@ import (
 // THE PUBLISHED FILE CARRIES THE PERMISSIONS THE PROCESS UMASK PRODUCES, NOT
 // THE RAW MODE AN ASSIGNMENT WOULD SET.
 //
-// The create path reserves the target name with the same exclusive create this
-// branch of the write path always honored, and the kernel applies the process
-// umask to the reserved file it grants. The publish must carry those granted
-// bits — taken from the reserved file itself — because a chmod never consults
-// the umask: a process that requests tight defaults on new files would find
-// every write it publishes shared with the world. Under the restrictive umask
-// a plain mode assignment would publish 0o644 where the reservation was
-// granted 0o600, so the test fails before the granted bits are carried.
-func TestCreatePublishesTheUmaskedPermissionsOfTheReservedCreate(t *testing.T) {
+// The create path opens its staging file with the same exclusive 0o644 create
+// this branch of the write path always honored, and the kernel applies the
+// process umask to that open. The publish must carry the granted bits — taken
+// from the staging file itself — because a chmod never consults the umask: a
+// process that requests tight defaults on new files would find every write it
+// publishes shared with the world. Under the restrictive umask a plain mode
+// assignment would publish 0o644 where the kernel granted 0o600, so the test
+// fails before the granted bits are carried.
+func TestCreatePublishesTheUmaskedPermissionsOfTheStagedCreate(t *testing.T) {
 	for name, testCase := range map[string]struct {
 		umask int
 		want  os.FileMode
@@ -46,7 +46,7 @@ func TestCreatePublishesTheUmaskedPermissionsOfTheReservedCreate(t *testing.T) {
 				t.Fatal(err)
 			}
 			if got := info.Mode().Perm(); got != testCase.want {
-				t.Fatalf("published mode = %#o, want the %#o the kernel granted the reservation under this umask; a raw mode assignment would publish %#o and share the file with hands the umask excludes", got, testCase.want, os.FileMode(0o644))
+				t.Fatalf("published mode = %#o, want the %#o the kernel granted the staging create under this umask; a raw mode assignment would publish %#o and share the file with hands the umask excludes", got, testCase.want, os.FileMode(0o644))
 			}
 			if got, readErr := os.ReadFile(target); readErr != nil || string(got) != "zero\n" {
 				t.Fatalf("published content = %q, err=%v", got, readErr)
