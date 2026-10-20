@@ -205,11 +205,43 @@ func reclaimStaleLock(lockPath, token string, staleAfter time.Duration) bool {
 		return false
 	}
 	if info, err := os.Stat(reclaimed); err == nil && time.Since(info.ModTime()) <= staleAfter {
-		_ = os.Rename(reclaimed, lockPath)
+		// The lock was replaced between our stat and rename, so put the fresh
+		// lock back without clobbering a third holder that acquired lockPath in
+		// the meantime.
+		_ = restoreReclaimedLock(reclaimed, lockPath)
 		return false
 	}
 	_ = os.Remove(reclaimed)
 	return true
+}
+
+// restoreReclaimedLock restores a quarantined lock only if lockPath is still
+// free. The destination is created exclusively; a newer holder is never
+// replaced. The quarantined copy is discarded either way.
+func restoreReclaimedLock(reclaimed, lockPath string) error {
+	data, err := os.ReadFile(reclaimed)
+	if err != nil {
+		_ = os.Remove(reclaimed)
+		return err
+	}
+	lock, err := openSecretLockFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		_ = os.Remove(reclaimed)
+		return err
+	}
+	if _, err := lock.Write(data); err != nil {
+		_ = lock.Close()
+		_ = os.Remove(lockPath)
+		_ = os.Remove(reclaimed)
+		return err
+	}
+	if err := lock.Close(); err != nil {
+		_ = os.Remove(lockPath)
+		_ = os.Remove(reclaimed)
+		return err
+	}
+	_ = os.Remove(reclaimed)
+	return nil
 }
 
 func writeNewSecretFile(path, publicationDir string) ([]byte, error) {

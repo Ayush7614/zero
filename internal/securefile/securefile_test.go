@@ -250,12 +250,72 @@ func TestSecretDirectorySyncFailureLeavesPublishedSecret(t *testing.T) {
 	if _, err := createSecretFile(secretPath, ""); !errors.Is(err, syncErr) {
 		t.Fatalf("createSecretFile error = %v, want %v", err, syncErr)
 	}
-	info, err := os.Stat(secretPath)
+	published, err := os.ReadFile(secretPath)
 	if err != nil {
-		t.Fatalf("published secret: %v", err)
+		t.Fatalf("read published secret: %v", err)
 	}
-	if info.Size() != secretBytes {
-		t.Fatalf("published secret size = %d, want %d", info.Size(), secretBytes)
+	if len(published) != secretBytes {
+		t.Fatalf("published secret size = %d, want %d", len(published), secretBytes)
+	}
+	loaded, err := createSecretFile(secretPath, "")
+	if err != nil {
+		t.Fatalf("later caller could not load the published secret: %v", err)
+	}
+	if !bytes.Equal(loaded, published) {
+		t.Fatal("later caller did not reuse the published secret")
+	}
+}
+
+// TestRestoreReclaimedLockDoesNotReplaceNewerLock covers the reclaim race: a
+// lock that looked stale can be replaced before the reclaimer renames it. If a
+// third holder then creates lockPath, restoring the quarantined lock must not
+// replace that newer lock.
+func TestRestoreReclaimedLockDoesNotReplaceNewerLock(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "k.secret.lock")
+	reclaimed := lockPath + ".stale.crashed"
+	if err := os.WriteFile(reclaimed, []byte("quarantined-token"), 0o600); err != nil {
+		t.Fatalf("write quarantined lock: %v", err)
+	}
+	if err := os.WriteFile(lockPath, []byte("new-holder-token"), 0o600); err != nil {
+		t.Fatalf("write newer lock: %v", err)
+	}
+
+	if err := restoreReclaimedLock(reclaimed, lockPath); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("restoreReclaimedLock error = %v, want %v", err, os.ErrExist)
+	}
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("read newer lock: %v", err)
+	}
+	if string(data) != "new-holder-token" {
+		t.Fatalf("newer lock was replaced: %q", data)
+	}
+	if _, err := os.Stat(reclaimed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("quarantined lock was not discarded: %v", err)
+	}
+}
+
+func TestRestoreReclaimedLockRestoresWhenDestinationIsFree(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "k.secret.lock")
+	reclaimed := lockPath + ".stale.crashed"
+	if err := os.WriteFile(reclaimed, []byte("fresh-token"), 0o600); err != nil {
+		t.Fatalf("write quarantined lock: %v", err)
+	}
+
+	if err := restoreReclaimedLock(reclaimed, lockPath); err != nil {
+		t.Fatalf("restoreReclaimedLock: %v", err)
+	}
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("read restored lock: %v", err)
+	}
+	if string(data) != "fresh-token" {
+		t.Fatalf("restored lock = %q", data)
+	}
+	if _, err := os.Stat(reclaimed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("quarantined lock was not discarded: %v", err)
 	}
 }
 
