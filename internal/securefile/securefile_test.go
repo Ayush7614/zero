@@ -237,6 +237,28 @@ func TestSecretCreationSyncsFileAndDirectory(t *testing.T) {
 	}
 }
 
+// TestSecretDirectorySyncFailureLeavesPublishedSecret pins the post-rename
+// path: a destination-directory barrier failure reports an error but the
+// renamed secret is already there and a later caller can load it.
+func TestSecretDirectorySyncFailureLeavesPublishedSecret(t *testing.T) {
+	secretPath := filepath.Join(t.TempDir(), "k.secret")
+	origDir := syncSecretDirFn
+	t.Cleanup(func() { syncSecretDirFn = origDir })
+	syncErr := errors.New("directory sync failed")
+	syncSecretDirFn = func(string) error { return syncErr }
+
+	if _, err := createSecretFile(secretPath, ""); !errors.Is(err, syncErr) {
+		t.Fatalf("createSecretFile error = %v, want %v", err, syncErr)
+	}
+	info, err := os.Stat(secretPath)
+	if err != nil {
+		t.Fatalf("published secret: %v", err)
+	}
+	if info.Size() != secretBytes {
+		t.Fatalf("published secret size = %d, want %d", info.Size(), secretBytes)
+	}
+}
+
 func TestSecretSyncFailureLeavesNoSecretAndRetrySucceeds(t *testing.T) {
 	secretPath := filepath.Join(t.TempDir(), "k.secret")
 	origFile := syncSecretFileFn

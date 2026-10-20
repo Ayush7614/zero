@@ -41,6 +41,31 @@ func TestFileBlobWriteSyncsFileAndDirectory(t *testing.T) {
 	}
 }
 
+// TestFileBlobWriteDirectorySyncFailureLeavesPublishedBlob pins the post-rename
+// path: the directory barrier runs after the atomic replace, so a barrier
+// failure reports an error but must not hide the already-published token.
+func TestFileBlobWriteDirectorySyncFailureLeavesPublishedBlob(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oauth-tokens.json")
+	blob := fileBlob{path: path}
+	if err := blob.write([]byte("old")); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	origDir := syncOAuthDirFn
+	t.Cleanup(func() { syncOAuthDirFn = origDir })
+	syncErr := errors.New("directory sync failed")
+	syncOAuthDirFn = func(string) error { return syncErr }
+
+	err := blob.write([]byte("new"))
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("write error = %v, want it to wrap %v", err, syncErr)
+	}
+	data, ok, err := blob.read()
+	if err != nil || !ok || !bytes.Equal(data, []byte("new")) {
+		t.Fatalf("published blob was not retained: data=%q ok=%v err=%v", data, ok, err)
+	}
+}
+
 func TestFileBlobWriteSyncFailurePreservesPrevious(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oauth-tokens.json")
 	blob := fileBlob{path: path}
