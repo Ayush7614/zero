@@ -5,9 +5,9 @@ import (
 	"io"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/contextreport"
-	"github.com/Gitlawb/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/contextreport"
+	"github.com/Twigpine/zero/internal/modelregistry"
 )
 
 type contextOptions struct {
@@ -40,10 +40,11 @@ func runContext(args []string, stdout io.Writer, stderr io.Writer, deps appDeps)
 		return writeAppError(stderr, err.Error(), exitCrash)
 	}
 	report, err := contextreport.Build(contextreport.Options{
-		WorkspaceRoot: workspaceRoot,
-		Provider:      resolved.Provider,
-		Registry:      newCoreRegistry(workspaceRoot),
-		ContextWindow: modelContextWindow(modelRegistry, resolved.Provider.Model),
+		WorkspaceRoot:  workspaceRoot,
+		Provider:       resolved.Provider,
+		Registry:       newCoreRegistry(workspaceRoot),
+		ContextWindow:  modelContextWindow(modelRegistry, resolved.Provider.Model),
+		DeferThreshold: resolved.Tools.DeferThreshold,
 	})
 	if err != nil {
 		return writeAppError(stderr, err.Error(), exitCrash)

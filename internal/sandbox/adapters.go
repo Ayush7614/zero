@@ -7,6 +7,7 @@ import (
 type BackendOptions struct {
 	GOOS             string
 	LookupExecutable func(string) (string, error)
+	DetectWSL        func() WSLInfo
 }
 
 type Backend struct {
@@ -18,10 +19,10 @@ type Backend struct {
 	NativeIsolation bool        `json:"nativeIsolation"`
 	Executable      string      `json:"executable,omitempty"`
 	// ExecutableArgsPrefix is prepended to a wrapped command's args before the
-	// sandbox arguments. Non-empty only for the Windows self-dispatch helper,
-	// where Executable is the running zero binary and this carries the hidden
-	// subcommand token (e.g. "__windows-command-runner"). nil for every other
-	// backend, so their serialized form is unchanged.
+	// sandbox arguments. Non-empty for self-dispatch helpers, where Executable
+	// is the running zero binary and this carries the hidden subcommand token
+	// ("__windows-command-runner" or "__sandbox-helper"). nil for standalone
+	// helper binaries, so their serialized form is unchanged.
 	ExecutableArgsPrefix []string `json:"executableArgsPrefix,omitempty"`
 	Message              string   `json:"message,omitempty"`
 }
@@ -53,6 +54,7 @@ func SelectBackend(options BackendOptions) Backend {
 	return NewSandboxManager(SandboxManagerOptions{
 		GOOS:             options.GOOS,
 		LookupExecutable: options.LookupExecutable,
+		DetectWSL:        options.DetectWSL,
 	}).Backend()
 }
 
@@ -131,6 +133,13 @@ func unavailableBackend(goos string, message string) Backend {
 	}
 }
 
+// BuildPlan renders the plan for introspection (`zero sandbox policy`). It has
+// no command to describe, so the profile is built with no command context: the
+// credential baseline resolves relative token overrides against THIS process's
+// environment and working directory only. Execution goes through
+// BuildCommandPlan instead, which passes the command's own dir and env and can
+// therefore produce additional deny-if-exists entries. Callers exporting this
+// plan should say which of the two they are showing.
 func (backend Backend) BuildPlan(workspaceRoot string, policy Policy) BackendPlan {
 	effectivePolicy := policy
 	if effectivePolicy.Mode == "" {
@@ -198,6 +207,21 @@ func (backend Backend) EnforcementLevel(policy Policy) EnforcementLevel {
 	return EnforcementDegraded
 }
 
+// DegradedNotice is one line saying the plan's enforcement is degraded and why,
+// or "" at any other level. Only degraded: a disabled sandbox is the user's own
+// choice, and the unelevated Windows tier still enforces the write jail and
+// says what it lacks through `zero sandbox policy`.
+func (plan BackendPlan) DegradedNotice() string {
+	if plan.EnforcementLevel != EnforcementDegraded {
+		return ""
+	}
+	reason := strings.TrimRight(strings.TrimSpace(plan.DowngradeReason), ".")
+	if reason == "" {
+		reason = "no native sandbox is available"
+	}
+	return "Sandbox enforcement is degraded: " + reason + ". See `zero sandbox policy --effective`."
+}
+
 func (backend Backend) DowngradeReason(policy Policy) string {
 	if policy.Mode == "" {
 		policy = DefaultPolicy()
@@ -225,7 +249,7 @@ func (backend Backend) SandboxEnvMarkers(policy Policy) []string {
 	if policy.Mode == ModeDisabled {
 		return nil
 	}
-	if !(backend.CommandWrapping && backend.Available) && backend.Name != BackendWSL {
+	if (!backend.CommandWrapping || !backend.Available) && backend.Name != BackendWSL {
 		return nil
 	}
 	name := backend.Name

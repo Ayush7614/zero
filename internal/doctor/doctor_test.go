@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/config"
+	"github.com/Twigpine/zero/internal/config"
 )
 
 func TestRunReportRedactsProviderSecretsAndWarnsWithoutConnectivity(t *testing.T) {
@@ -388,9 +388,9 @@ func TestProviderConfigCheckCredentialPresence(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := providerConfigCheck(tc.profile).Details["credentialConfigured"]
+			got := providerConfigCheck(tc.profile).Details["authConfigured"]
 			if got != tc.want {
-				t.Fatalf("credentialConfigured = %v, want %q (matches ProviderSnapshot.APIKeySet trimming)", got, tc.want)
+				t.Fatalf("authConfigured = %v, want %q (matches ProviderSnapshot.APIKeySet trimming)", got, tc.want)
 			}
 		})
 	}

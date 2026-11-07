@@ -3,10 +3,11 @@ package anthropic
 import (
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 func TestMapStopReasonRefusal(t *testing.T) {
+	t.Parallel()
 	if got := mapStopReason("refusal"); got != zeroruntime.FinishReasonContentFilter {
 		t.Errorf("refusal → %q, want content_filter (M4)", got)
 	}

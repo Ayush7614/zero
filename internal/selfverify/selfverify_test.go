@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/redaction"
-	"github.com/Gitlawb/zero/internal/verify"
+	"github.com/Twigpine/zero/internal/redaction"
+	"github.com/Twigpine/zero/internal/verify"
 )
 
 func TestRunStopsAfterPassingAttempt(t *testing.T) {
@@ -110,7 +110,7 @@ func TestRunDefaultsToOneAttempt(t *testing.T) {
 
 func TestRunStopsOnRemediatorErrorAndRedacts(t *testing.T) {
 	root := t.TempDir()
-	secret := "sk-proj-abcdefghijklmnopqrstuvwxyz"
+	secret := "sk-proj-abcdefghijklmnopqrstuvwxyz0"
 	plan := verify.Plan{Root: root, Checks: []verify.Check{{ID: "go.test", Name: "Go tests", Command: []string{"go", "test", "./..."}}}}
 	runner := &fakeVerifyRunner{results: []verify.CommandResult{{ExitCode: 1, Stdout: "FAIL\n"}}}
 

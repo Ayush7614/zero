@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/provideronboarding"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/provideronboarding"
 )
 
 func TestRunProvidersDetectSurfacesLocalRuntimeAndProviderActions(t *testing.T) {
@@ -103,5 +103,15 @@ func TestRunProvidersDetectJSONNoRuntimesActiveProvider(t *testing.T) {
 	}
 	if len(payload.Providers[0].Actions) != 1 || payload.Providers[0].Actions[0].Label != "Check provider" {
 		t.Fatalf("expected only a Check action for an active keyed provider, got %#v", payload.Providers[0].Actions)
+	}
+}
+
+func TestProviderDetectShowsGuidanceWithoutCommand(t *testing.T) {
+	for _, models := range [][]string{nil, {"local-model"}, {"x&calc"}} {
+		runtime := provideronboarding.DetectedLocalRuntime{LocalRuntime: provideronboarding.LocalRuntime{CatalogID: "atomic-chat-local", Name: "Atomic Chat Local", DefaultModel: "local-model"}, Models: models}
+		out := formatProviderDetectReport(buildProviderDetectReport(config.ResolvedConfig{}, []provideronboarding.DetectedLocalRuntime{runtime}))
+		if strings.Contains(out, "providers add") || !strings.Contains(out, runtime.SetupAction().Detail) {
+			t.Fatalf("missing actionable guidance: %s", out)
+		}
 	}
 }

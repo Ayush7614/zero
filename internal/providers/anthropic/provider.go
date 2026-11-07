@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/providers/providerio"
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/providers/providerio"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 const defaultBaseURL = "https://api.anthropic.com"
@@ -46,6 +46,19 @@ func thinkingBudgetForEffort(effort string) int {
 		return 24000
 	default:
 		return 0
+	}
+}
+
+func miniMaxM31FlashEffort(model, effort string) string {
+	if !strings.EqualFold(strings.TrimSpace(model), "MiniMax-M3.1-Flash") {
+		return ""
+	}
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	switch effort {
+	case "low", "medium", "high", "xhigh", "max":
+		return effort
+	default:
+		return ""
 	}
 }
 
@@ -90,6 +103,7 @@ type Options struct {
 	// When unset, Zero uses providerio.ResolveStreamIdleTimeout — the
 	// ZERO_STREAM_IDLE_TIMEOUT override or providerio.DefaultStreamIdleTimeout.
 	StreamIdleTimeout time.Duration
+	SessionHeader     string
 }
 
 // Provider streams completions from Anthropic's Messages API.
@@ -108,6 +122,7 @@ type Provider struct {
 	httpClient        *http.Client
 	userAgent         string
 	streamIdleTimeout time.Duration
+	sessionHeader     providerio.SessionHeader
 }
 
 // New creates an Anthropic provider.
@@ -143,6 +158,7 @@ func New(options Options) (*Provider, error) {
 		httpClient:        providerio.HTTPClient(options.HTTPClient),
 		userAgent:         options.UserAgent,
 		streamIdleTimeout: providerio.ResolveStreamIdleTimeout(options.StreamIdleTimeout),
+		sessionHeader:     providerio.NewSessionHeader(options.SessionHeader),
 	}, nil
 }
 
@@ -163,12 +179,12 @@ func (provider *Provider) StreamCompletion(
 	events := make(chan zeroruntime.StreamEvent, 16)
 	go func() {
 		defer close(events)
-		provider.stream(ctx, body, events)
+		provider.stream(ctx, body, request.PromptCacheKey, events)
 	}()
 	return events, nil
 }
 
-func (provider *Provider) stream(ctx context.Context, body []byte, events chan<- zeroruntime.StreamEvent) {
+func (provider *Provider) stream(ctx context.Context, body []byte, sessionID string, events chan<- zeroruntime.StreamEvent) {
 	// streamCtx lets the idle watchdog abort an in-flight body read by cancelling
 	// the request, which unblocks the SSE reader goroutine.
 	streamCtx, cancelStream := context.WithCancel(ctx)
@@ -185,6 +201,7 @@ func (provider *Provider) stream(ctx context.Context, body []byte, events chan<-
 		},
 		provider.oauthResolver,
 		func(request *http.Request) {
+			provider.sessionHeader.Apply(request, sessionID)
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("anthropic-version", provider.version)
 			if provider.beta != "" {
@@ -373,11 +390,15 @@ func (provider *Provider) anthropicRequest(request zeroruntime.CompletionRequest
 		Messages:  messages,
 		Stream:    true,
 	}
-	// Extended thinking: enable when a reasoning effort was requested. The budget
-	// is counted against max_tokens, so raise max_tokens to leave room for the
-	// response. Temperature is intentionally left unset (Anthropic requires the
-	// default when thinking is on).
-	if budget, effectiveMax, enabled := resolveThinking(request.ReasoningEffort, provider.maxTokens); enabled {
+	// MiniMax-M3.1-Flash uses adaptive thinking with output_config.effort instead
+	// of Anthropic's token budget. For other models, the budget is counted against
+	// max_tokens, so raise max_tokens to leave room for the response. Temperature
+	// is intentionally left unset (Anthropic requires the default when thinking
+	// is on).
+	if effort := miniMaxM31FlashEffort(provider.model, request.ReasoningEffort); effort != "" {
+		mapped.Thinking = &thinkingConfig{Type: "adaptive"}
+		mapped.OutputConfig = &outputConfig{Effort: effort}
+	} else if budget, effectiveMax, enabled := resolveThinking(request.ReasoningEffort, provider.maxTokens); enabled {
 		mapped.MaxTokens = effectiveMax
 		mapped.Thinking = &thinkingConfig{Type: "enabled", BudgetTokens: budget}
 	}

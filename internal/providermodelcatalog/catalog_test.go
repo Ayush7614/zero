@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/providercatalog"
+	"github.com/Twigpine/zero/internal/providercatalog"
 )
 
 func TestModelsAreProviderScoped(t *testing.T) {
@@ -29,9 +29,34 @@ func TestModelsAreProviderScoped(t *testing.T) {
 			notWant:  []string{"gpt-4.1", "claude-sonnet-4.5"},
 		},
 		{
+			provider: "fireworks",
+			want:     []string{"accounts/fireworks/models/kimi-k2p7-code", "accounts/fireworks/models/deepseek-v4-flash"},
+			notWant:  []string{"gpt-4.1", "llama-3.3-70b-versatile"},
+		},
+		{
 			provider: "chatgpt",
-			want:     []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"},
-			notWant:  []string{"gpt-5", "gpt-4.1", "openai/gpt-4.1"},
+			want:     []string{"gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-luna"},
+			notWant:  []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark", "openai/gpt-4.1"},
+		},
+		{
+			provider: "aimlapi",
+			want:     []string{"anthropic/claude-sonnet-5", "google/gemini-3.5-flash", "openai/gpt-5.5-2026-04-23", "qwen/qwen-3.7-max", "deepseek/deepseek-v4-pro"},
+			notWant:  []string{"gpt-4o", "openai/gpt-4o", "anthropic/claude-opus-4.8", "x-ai/grok-4-5"},
+		},
+		{
+			provider: "atlascloud",
+			want:     []string{"qwen/qwen3.5-flash", "deepseek-ai/deepseek-v4-pro"},
+			notWant:  []string{"gpt-4.1", "claude-sonnet-4.5", "openai/gpt-4.1"},
+		},
+		{
+			provider: "gmicloud",
+			want:     []string{"Qwen/Qwen3.8-Max", "Qwen/Qwen3.8-Flash", "deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4-Flash"},
+			notWant:  []string{"gpt-4.1", "claude-sonnet-4.5", "deepseek-ai/deepseek-v4-pro"},
+		},
+		{
+			provider: "concentrate",
+			want:     []string{"deepseek-v4-flash-0731", "deepseek-v4-pro", "kimi-k3", "glm-5.3"},
+			notWant:  []string{"gpt-4.1", "claude-sonnet-4.5", "deepseek-ai/DeepSeek-V4-Pro"},
 		},
 		{
 			provider: "mistral",
@@ -40,7 +65,7 @@ func TestModelsAreProviderScoped(t *testing.T) {
 		},
 		{
 			provider: "minimaxi-cn",
-			want:     []string{"MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.1"},
+			want:     []string{"MiniMax-M3", "MiniMax-M3.1-Flash", "MiniMax-M2.7", "MiniMax-M2.1"},
 			notWant:  []string{"gpt-4.1", "claude-sonnet-4.5"},
 		},
 		{
@@ -107,6 +132,25 @@ func TestModelsDoNotAliasMutableCatalogState(t *testing.T) {
 	}
 }
 
+func TestDedupeModelsDoesNotAliasCapabilitySlices(t *testing.T) {
+	models := []Model{{
+		ID:               "reasoner",
+		ReasoningEfforts: []string{"low", "high"},
+		ServiceTiers:     []string{"priority"},
+	}}
+	first := dedupeModels("reasoner", models)
+	first[0].ReasoningEfforts[0] = "mutated"
+	first[0].ServiceTiers[0] = "mutated"
+
+	second := dedupeModels("reasoner", models)
+	if got, want := second[0].ReasoningEfforts[0], "low"; got != want {
+		t.Fatalf("reasoning efforts alias source state: got %q, want %q", got, want)
+	}
+	if got, want := second[0].ServiceTiers[0], "priority"; got != want {
+		t.Fatalf("service tiers alias source state: got %q, want %q", got, want)
+	}
+}
+
 func modelIDs(models []Model) []string {
 	ids := make([]string, 0, len(models))
 	for _, model := range models {
@@ -121,8 +165,8 @@ func TestMiniMaxModelsExposeCurrentCapabilities(t *testing.T) {
 		t.Fatal("provider minimax missing from catalog")
 	}
 	models := Models(descriptor)
-	if len(models) < 2 || models[0].ID != "MiniMax-M3" || models[1].ID != "MiniMax-M2.7" {
-		t.Fatalf("MiniMax current models = %#v, want MiniMax-M3 followed by MiniMax-M2.7", modelIDs(models))
+	if len(models) < 3 || models[0].ID != "MiniMax-M3" || models[1].ID != "MiniMax-M3.1-Flash" || models[2].ID != "MiniMax-M2.7" {
+		t.Fatalf("MiniMax current models = %#v, want MiniMax-M3, MiniMax-M3.1-Flash, then MiniMax-M2.7", modelIDs(models))
 	}
 
 	m3 := models[0]
@@ -134,13 +178,51 @@ func TestMiniMaxModelsExposeCurrentCapabilities(t *testing.T) {
 		t.Fatalf("MiniMax-M3 modalities = input:%#v output:%#v", m3.InputModalities, m3.OutputModalities)
 	}
 
-	m27 := models[1]
+	m31Flash := models[1]
+	if m31Flash.ContextWindow != 1_000_000 || !m31Flash.ToolCall || !m31Flash.Reasoning {
+		t.Fatalf("MiniMax-M3.1-Flash capabilities = %#v, want 1M context with tools and reasoning", m31Flash)
+	}
+	if !reflect.DeepEqual(m31Flash.ReasoningEfforts, []string{"low", "medium", "high", "xhigh", "max"}) ||
+		m31Flash.DefaultReasoningEffort != "max" {
+		t.Fatalf("MiniMax-M3.1-Flash reasoning efforts = %#v default %q", m31Flash.ReasoningEfforts, m31Flash.DefaultReasoningEffort)
+	}
+	if !reflect.DeepEqual(m31Flash.InputModalities, []string{"text", "image", "video"}) ||
+		!reflect.DeepEqual(m31Flash.OutputModalities, []string{"text"}) {
+		t.Fatalf("MiniMax-M3.1-Flash modalities = input:%#v output:%#v", m31Flash.InputModalities, m31Flash.OutputModalities)
+	}
+	if m31Flash.InputCost != 0.15 || m31Flash.OutputCost != 0.60 {
+		t.Fatalf("MiniMax-M3.1-Flash costs = %f/%f, want 0.15/0.60", m31Flash.InputCost, m31Flash.OutputCost)
+	}
+
+	m27 := models[2]
 	if m27.ContextWindow != 204_800 || !m27.ToolCall || !m27.Reasoning {
 		t.Fatalf("MiniMax-M2.7 capabilities = %#v, want 204.8K context with tools and reasoning", m27)
 	}
 	if !reflect.DeepEqual(m27.InputModalities, []string{"text"}) ||
 		!reflect.DeepEqual(m27.OutputModalities, []string{"text"}) {
 		t.Fatalf("MiniMax-M2.7 modalities = input:%#v output:%#v", m27.InputModalities, m27.OutputModalities)
+	}
+}
+
+func TestConcentrateModelsExposeCatalogLimits(t *testing.T) {
+	descriptor, ok := providercatalog.Get("concentrate")
+	if !ok {
+		t.Fatal("provider concentrate missing from catalog")
+	}
+	models := Models(descriptor)
+	if got, want := modelIDs(models), []string{"deepseek-v4-flash-0731", "deepseek-v4-pro", "kimi-k3", "glm-5.3"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Concentrate models = %#v, want %#v", got, want)
+	}
+	if models[0].Description != "catalog default" {
+		t.Fatalf("first Concentrate model description = %q, want catalog default", models[0].Description)
+	}
+	for _, model := range models {
+		if model.ContextWindow != 1_048_576 || !model.ToolCall || !model.Reasoning {
+			t.Fatalf("%s capabilities = %#v, want 1,048,576 context with tools and reasoning", model.ID, model)
+		}
+		if model.Source != concentrateModelSource {
+			t.Fatalf("%s source = %q, want %q", model.ID, model.Source, concentrateModelSource)
+		}
 	}
 }
 

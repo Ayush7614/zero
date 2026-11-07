@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/sandbox"
-	"github.com/Gitlawb/zero/internal/tools"
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 func TestRequestPermissionsTurnGrantAllowsLaterToolAndCleansUp(t *testing.T) {
@@ -180,7 +180,7 @@ func TestInlineAdditionalPermissionsRequiresPromptUnderAutoAllow(t *testing.T) {
 		},
 	}
 	decision := &sandbox.Decision{Action: sandbox.ActionAllow, AutoAllowed: true}
-	if !shouldRequestPermission(tools.NewBashTool(t.TempDir()), args, false, decision) {
+	if !shouldRequestPermission(tools.NewScopedBashTool(t.TempDir(), nil), args, false, decision) {
 		t.Fatal("inline additional permissions must request approval even when a sandboxed shell would otherwise auto-allow")
 	}
 }

@@ -9,12 +9,12 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/oauth"
-	"github.com/Gitlawb/zero/internal/providercatalog"
-	"github.com/Gitlawb/zero/internal/providerhealth"
-	"github.com/Gitlawb/zero/internal/provideronboarding"
-	"github.com/Gitlawb/zero/internal/tui"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/oauth"
+	"github.com/Twigpine/zero/internal/providercatalog"
+	"github.com/Twigpine/zero/internal/providerhealth"
+	"github.com/Twigpine/zero/internal/provideronboarding"
+	"github.com/Twigpine/zero/internal/tui"
 )
 
 type setupOptions struct {
@@ -42,7 +42,7 @@ func runSetup(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) i
 		return exitSuccess
 	}
 	if strings.TrimSpace(options.catalogID) == "" {
-		return runInteractiveTUIWithSetup(stderr, deps, "", nil, "", true)
+		return runInteractiveTUIWithSetup(stderr, deps, "", nil, "", true, false)
 	}
 
 	result, err := saveSetupProvider(deps, tui.SetupSelection{

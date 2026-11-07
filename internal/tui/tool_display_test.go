@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/tools"
 )
 
 func TestToolDisplayNameCleansMCPNames(t *testing.T) {
@@ -37,5 +37,27 @@ func TestToolCardHeadShowsCleanMCPName(t *testing.T) {
 	}
 	if !strings.Contains(out, "web search") {
 		t.Errorf("card head should show the clean 'web search' label:\n%s", out)
+	}
+}
+
+func TestToolResultCardShowsCompactOutputAndRawArtifact(t *testing.T) {
+	row := transcriptRow{
+		kind:   rowToolResult,
+		id:     "compact",
+		tool:   "exec_command",
+		status: tools.StatusOK,
+		detail: "output:\n[zero] 20 passing package lines omitted\nexit_code: 0",
+		meta: map[string]string{
+			"truncated":  "true",
+			"spill_path": "/tmp/zero-output.log",
+			"output_budget_estimated_original_tokens": "4200",
+			"output_budget_estimated_retained_tokens": "180",
+		},
+	}
+	rendered := plainRender(t, (model{}).renderRow(row, 100, buildRowContext([]transcriptRow{row})))
+	for _, want := range []string{"compact 4.2k→180 tok", "raw saved"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered compact result missing %q:\n%s", want, rendered)
+		}
 	}
 }

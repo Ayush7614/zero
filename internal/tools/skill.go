@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/skills"
+	"github.com/Twigpine/zero/internal/skills"
 )
 
 // skillTool lets the model pull a reusable instruction "skill" into context on
@@ -48,7 +48,8 @@ func NewSkillTool(dir string) *skillTool {
 				// unknown keys (AdditionalProperties:false).
 				AdditionalProperties: false,
 			},
-			safety: readOnlySafety("Reads a local skill file; gathers reusable instructions only."),
+			safety:       readOnlySafety("Reads a local skill file; gathers reusable instructions only."),
+			capabilities: ToolCapabilities{Effect: EffectReadOnly, ThreadSafe: true},
 		},
 	}
 }
@@ -72,7 +73,7 @@ func (tool *skillTool) Run(_ context.Context, args map[string]any) Result {
 	names := make([]string, 0, len(loaded))
 	for _, skill := range loaded {
 		if skill.Name == name {
-			return okResult(skill.Content)
+			return okResult(skills.ToolOutput(skill))
 		}
 		names = append(names, skill.Name)
 	}

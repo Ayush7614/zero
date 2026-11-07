@@ -5,8 +5,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/provideronboarding"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/provideronboarding"
 )
 
 type providerDetectOptions struct {
@@ -40,7 +40,7 @@ type providerDetectReport struct {
 }
 
 // runProvidersDetect probes the machine for running local, OpenAI-compatible
-// model runtimes (Ollama, LM Studio) and prints a no-key adopt command for each
+// model runtimes (Ollama, LM Studio, Atomic Chat) and prints a no-key adopt command for each
 // one it finds, followed by the next-step actions for every already-configured
 // provider. It is the onboarding-advice surface — "what can I do right now?" —
 // and never errors on a machine with nothing running locally (it just reports an
@@ -83,10 +83,10 @@ func runProvidersDetect(args []string, stdout io.Writer, stderr io.Writer, deps 
 func parseProviderDetectArgs(args []string) (providerDetectOptions, bool, error) {
 	options := providerDetectOptions{}
 	for _, arg := range args {
-		switch {
-		case arg == "-h" || arg == "--help" || arg == "help":
+		switch arg {
+		case "-h", "--help", "help":
 			return options, true, nil
-		case arg == "--json":
+		case "--json":
 			options.json = true
 		default:
 			return options, false, execUsageError{fmt.Sprintf("unexpected argument %q", arg)}
@@ -146,6 +146,8 @@ func formatProviderDetectReport(report providerDetectReport) string {
 		}
 		if command := strings.TrimSpace(runtime.Action.Command); command != "" {
 			lines = append(lines, "    "+runtime.Action.Label+": "+command)
+		} else if detail := strings.TrimSpace(runtime.Action.Detail); detail != "" {
+			lines = append(lines, "    "+runtime.Action.Label+": "+detail)
 		}
 	}
 

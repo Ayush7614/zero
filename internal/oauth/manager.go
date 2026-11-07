@@ -218,13 +218,26 @@ func (m *Manager) resolveEndpoints(ctx context.Context, cfg Config) (Config, err
 	// may already be sufficient for the chosen flow. Only merge on success (and
 	// never return from the error branch, which would trip the nilerr linter).
 	if meta, err := m.discover(ctx, cfg.IssuerURL); err == nil {
-		if cfg.AuthorizationEndpoint == "" {
+		// A discovered endpoint must pass the same https/loopback rule as a
+		// configured one before it is merged, so discovery metadata can never
+		// silently downgrade the login to an insecure or attacker-controlled
+		// endpoint. Fail closed on a bad endpoint rather than merging it.
+		if cfg.AuthorizationEndpoint == "" && meta.AuthorizationEndpoint != "" {
+			if err := ValidateEndpointURL(meta.AuthorizationEndpoint); err != nil {
+				return cfg, fmt.Errorf("oauth: discovered authorization endpoint: %w", err)
+			}
 			cfg.AuthorizationEndpoint = meta.AuthorizationEndpoint
 		}
-		if cfg.TokenEndpoint == "" {
+		if cfg.TokenEndpoint == "" && meta.TokenEndpoint != "" {
+			if err := ValidateEndpointURL(meta.TokenEndpoint); err != nil {
+				return cfg, fmt.Errorf("oauth: discovered token endpoint: %w", err)
+			}
 			cfg.TokenEndpoint = meta.TokenEndpoint
 		}
-		if cfg.DeviceAuthorizationEndpoint == "" {
+		if cfg.DeviceAuthorizationEndpoint == "" && meta.DeviceAuthorizationEndpoint != "" {
+			if err := ValidateEndpointURL(meta.DeviceAuthorizationEndpoint); err != nil {
+				return cfg, fmt.Errorf("oauth: discovered device authorization endpoint: %w", err)
+			}
 			cfg.DeviceAuthorizationEndpoint = meta.DeviceAuthorizationEndpoint
 		}
 	}
@@ -401,6 +414,14 @@ func (m *Manager) resolveConfigForKey(ctx context.Context, key string) (Config, 
 // Logout removes a provider's stored token, reporting whether one was present.
 func (m *Manager) Logout(name string) (bool, error) {
 	return m.store.Delete(ProviderKey(name))
+}
+
+// Reset clears all persistent state in the underlying store.
+func (m *Manager) Reset() error {
+	if m == nil || m.store == nil {
+		return nil
+	}
+	return m.store.Reset()
 }
 
 // StatusAll returns the status of every provider login.

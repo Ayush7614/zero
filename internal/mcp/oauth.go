@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/oauth"
+	"github.com/Twigpine/zero/internal/oauth"
 )
 
 // ServerAuthOAuth is the value of an MCP server's auth field that selects the
@@ -59,12 +59,18 @@ func tokenToStored(t oauth.Token) StoredToken {
 		TokenType:    t.TokenType,
 		Scopes:       t.Scopes,
 		ExpiresAt:    t.ExpiresAt,
+
+		TokenEndpoint:          t.TokenEndpoint,
+		ProtectedTokenEndpoint: t.ProtectedTokenEndpoint,
+		ClientID:               t.ClientID,
+		ClientSecret:           t.ClientSecret,
 	}
 }
 
 // OAuthConfig describes how to authenticate to a remote MCP server using OAuth.
-// Endpoints may be discovered from the server's metadata document; explicit
-// values here override or fill in anything discovery cannot provide.
+// Endpoints may be discovered through RFC 9728 protected-resource metadata and
+// RFC 8414 authorization-server metadata; explicit values override or fill in
+// anything discovery cannot provide.
 type OAuthConfig struct {
 	ClientID              string
 	ClientSecret          string
@@ -85,6 +91,11 @@ type authServerMetadata struct {
 	TokenEndpoint         string   `json:"token_endpoint"`
 	RegistrationEndpoint  string   `json:"registration_endpoint"`
 	ScopesSupported       []string `json:"scopes_supported"`
+
+	protectedResourceURL         string
+	protectAuthorizationEndpoint bool
+	protectTokenEndpoint         bool
+	protectRegistrationEndpoint  bool
 }
 
 // pkceParams holds a PKCE verifier/challenge pair.
@@ -120,7 +131,7 @@ type authorizationFlow struct {
 // discoverAuthorizationServer fetches the RFC 8414 authorization server metadata
 // at the well-known path under baseURL, via the shared engine.
 func discoverAuthorizationServer(ctx context.Context, client *http.Client, baseURL string) (authServerMetadata, error) {
-	meta, err := oauth.DiscoverAuthorizationServer(ctx, client, baseURL)
+	meta, err := oauth.DiscoverAuthorizationServer(ctx, withoutDiscoveryRedirects(client), baseURL)
 	if err != nil {
 		return authServerMetadata{}, err
 	}
@@ -133,9 +144,62 @@ func discoverAuthorizationServer(ctx context.Context, client *http.Client, baseU
 	}, nil
 }
 
-// resolveAuthorizationServer discovers metadata and applies explicit config
-// overrides. Configured endpoints take precedence over discovered ones, and act
-// as a fallback when discovery fails or omits a value.
+// validateResolvedEndpoints applies the shared https/loopback scheme rule to
+// every non-empty endpoint in the resolved metadata. Protected-resource
+// discovery adds its stricter provenance-aware network rule below.
+func validateResolvedEndpoints(metadata authServerMetadata) error {
+	for _, ep := range []struct{ kind, url string }{
+		{"authorization", metadata.AuthorizationEndpoint},
+		{"token", metadata.TokenEndpoint},
+		{"registration", metadata.RegistrationEndpoint},
+	} {
+		if strings.TrimSpace(ep.url) == "" {
+			continue
+		}
+		if err := oauth.ValidateEndpointURL(ep.url); err != nil {
+			return fmt.Errorf("mcp oauth: %s endpoint: %w", ep.kind, err)
+		}
+	}
+	return nil
+}
+
+func validateProtectedDiscoveredEndpoints(ctx context.Context, metadata authServerMetadata) error {
+	if metadata.protectedResourceURL == "" {
+		return nil
+	}
+	policy, err := newOAuthDiscoveryNetworkPolicy(metadata.protectedResourceURL)
+	if err != nil {
+		return err
+	}
+	for _, endpoint := range []struct {
+		kind      string
+		url       string
+		protected bool
+	}{
+		{kind: "authorization", url: metadata.AuthorizationEndpoint, protected: metadata.protectAuthorizationEndpoint},
+		{kind: "token", url: metadata.TokenEndpoint, protected: metadata.protectTokenEndpoint},
+		{kind: "registration", url: metadata.RegistrationEndpoint, protected: metadata.protectRegistrationEndpoint},
+	} {
+		if !endpoint.protected || strings.TrimSpace(endpoint.url) == "" {
+			continue
+		}
+		parsed, parseErr := url.Parse(endpoint.url)
+		if parseErr != nil || parsed.Hostname() == "" {
+			return fmt.Errorf("mcp oauth: %s endpoint: %w", endpoint.kind, errUnsafeOAuthDiscoveryTarget)
+		}
+		if err := policy.validateLiteralHost(parsed.Hostname()); err != nil {
+			return fmt.Errorf("mcp oauth: %s endpoint: %w", endpoint.kind, err)
+		}
+		if _, err := policy.resolve(ctx, parsed.Hostname()); err != nil {
+			return fmt.Errorf("mcp oauth: %s endpoint: %w", endpoint.kind, err)
+		}
+	}
+	return nil
+}
+
+// resolveAuthorizationServer follows protected-resource metadata when the MCP
+// endpoint advertises it, falls back to direct authorization-server discovery
+// for legacy providers, then applies explicit config overrides.
 func resolveAuthorizationServer(ctx context.Context, client *http.Client, baseURL string, cfg OAuthConfig) (authServerMetadata, error) {
 	// When the config supplies both the authorization and token endpoints
 	// directly, skip network discovery entirely: there is nothing to discover,
@@ -148,19 +212,45 @@ func resolveAuthorizationServer(ctx context.Context, client *http.Client, baseUR
 			TokenEndpoint:         strings.TrimSpace(cfg.TokenEndpoint),
 			RegistrationEndpoint:  strings.TrimSpace(cfg.RegistrationEndpoint),
 		}
+		if err := validateResolvedEndpoints(metadata); err != nil {
+			return authServerMetadata{}, err
+		}
 		return metadata, nil
 	}
 
+	discoveryClient := withoutDiscoveryRedirects(client)
 	discoveryBase := strings.TrimSpace(cfg.IssuerURL)
+	protectedResourceDiscovery := false
 	if discoveryBase == "" {
-		discoveryBase = baseURL
+		issuer, found, protectedErr := discoverProtectedResourceAuthorizationServer(ctx, discoveryClient, baseURL)
+		if protectedErr != nil {
+			return authServerMetadata{}, protectedErr
+		}
+		if found {
+			discoveryBase = issuer
+			protectedResourceDiscovery = true
+			discoveryClient, protectedErr = newAdvertisedOAuthDiscoveryClient(discoveryClient, baseURL)
+			if protectedErr != nil {
+				return authServerMetadata{}, protectedErr
+			}
+		} else {
+			discoveryBase = baseURL
+		}
 	}
 
-	metadata, err := discoverAuthorizationServer(ctx, client, discoveryBase)
+	metadata, err := discoverAuthorizationServer(ctx, discoveryClient, discoveryBase)
 	if err != nil {
 		// Discovery failures are non-fatal when the config supplies the endpoints
 		// directly; otherwise surface the discovery error.
 		metadata = authServerMetadata{}
+	}
+	if protectedResourceDiscovery {
+		if strings.TrimSpace(metadata.Issuer) == "" {
+			return authServerMetadata{}, errors.New("mcp oauth: authorization server metadata is missing its required issuer")
+		}
+		if metadata.Issuer != discoveryBase {
+			return authServerMetadata{}, errors.New("mcp oauth: authorization server metadata issuer does not match protected resource metadata")
+		}
 	}
 
 	if endpoint := strings.TrimSpace(cfg.AuthorizationEndpoint); endpoint != "" {
@@ -172,12 +262,24 @@ func resolveAuthorizationServer(ctx context.Context, client *http.Client, baseUR
 	if endpoint := strings.TrimSpace(cfg.RegistrationEndpoint); endpoint != "" {
 		metadata.RegistrationEndpoint = endpoint
 	}
+	if protectedResourceDiscovery {
+		metadata.protectedResourceURL = strings.TrimSpace(baseURL)
+		metadata.protectAuthorizationEndpoint = strings.TrimSpace(cfg.AuthorizationEndpoint) == ""
+		metadata.protectTokenEndpoint = strings.TrimSpace(cfg.TokenEndpoint) == ""
+		metadata.protectRegistrationEndpoint = strings.TrimSpace(cfg.RegistrationEndpoint) == ""
+	}
 
 	if strings.TrimSpace(metadata.AuthorizationEndpoint) == "" {
 		return authServerMetadata{}, errors.New("no authorization endpoint discovered or configured")
 	}
 	if strings.TrimSpace(metadata.TokenEndpoint) == "" {
 		return authServerMetadata{}, errors.New("no token endpoint discovered or configured")
+	}
+	if err := validateResolvedEndpoints(metadata); err != nil {
+		return authServerMetadata{}, err
+	}
+	if err := validateProtectedDiscoveredEndpoints(ctx, metadata); err != nil {
+		return authServerMetadata{}, err
 	}
 	return metadata, nil
 }
@@ -244,7 +346,53 @@ func refreshAccessToken(ctx context.Context, client *http.Client, cfg OAuthConfi
 	if err != nil {
 		return StoredToken{}, err
 	}
-	return tokenToStored(token), nil
+	refreshed := tokenToStored(token)
+	// The token response never carries what Login learned about the client and
+	// endpoint, so carry it over or the next refresh would lose it.
+	refreshed.TokenEndpoint = current.TokenEndpoint
+	refreshed.ProtectedTokenEndpoint = current.ProtectedTokenEndpoint
+	refreshed.ClientID = current.ClientID
+	refreshed.ClientSecret = current.ClientSecret
+	return refreshed, nil
+}
+
+// refreshSettings fills the gaps in the configured OAuth settings from what the
+// login stored: the discovered token endpoint and the dynamically registered
+// client. Explicit config always wins. A stored endpoint is re-validated before
+// credentials are posted to it, and one that came from server-advertised
+// discovery is also held to the public-network policy, with the returned client
+// pinned to it, exactly as Login did.
+func refreshSettings(ctx context.Context, client *http.Client, resourceURL string, cfg OAuthConfig, stored StoredToken) (OAuthConfig, *http.Client, error) {
+	if strings.TrimSpace(cfg.ClientID) == "" && strings.TrimSpace(stored.ClientID) != "" {
+		cfg.ClientID = stored.ClientID
+		if strings.TrimSpace(cfg.ClientSecret) == "" {
+			cfg.ClientSecret = stored.ClientSecret
+		}
+	}
+	if strings.TrimSpace(cfg.TokenEndpoint) != "" || strings.TrimSpace(stored.TokenEndpoint) == "" {
+		return cfg, client, nil
+	}
+	endpoint := strings.TrimSpace(stored.TokenEndpoint)
+	if err := oauth.ValidateEndpointURL(endpoint); err != nil {
+		return cfg, client, fmt.Errorf("mcp oauth: stored token endpoint: %w", err)
+	}
+	if stored.ProtectedTokenEndpoint {
+		metadata := authServerMetadata{
+			TokenEndpoint:        endpoint,
+			protectedResourceURL: strings.TrimSpace(resourceURL),
+			protectTokenEndpoint: true,
+		}
+		if err := validateProtectedDiscoveredEndpoints(ctx, metadata); err != nil {
+			return cfg, client, err
+		}
+		protected, err := newAdvertisedOAuthDiscoveryClient(client, metadata.protectedResourceURL)
+		if err != nil {
+			return cfg, client, err
+		}
+		client = protected
+	}
+	cfg.TokenEndpoint = endpoint
+	return cfg, client, nil
 }
 
 // registerClient performs dynamic client registration against the registration
@@ -337,16 +485,34 @@ func Login(ctx context.Context, options LoginOptions) (StoredToken, error) {
 	}
 	defer listener.Close()
 	redirectURI := fmt.Sprintf("http://%s/callback", listener.Addr().String())
+	protectedEndpointClient := httpClient
+	if metadata.protectRegistrationEndpoint || metadata.protectTokenEndpoint {
+		protectedEndpointClient, err = newAdvertisedOAuthDiscoveryClient(httpClient, metadata.protectedResourceURL)
+		if err != nil {
+			return StoredToken{}, err
+		}
+	}
+	tokenClient := httpClient
+	if metadata.protectTokenEndpoint {
+		tokenClient = protectedEndpointClient
+	}
 
+	registeredClientID, registeredClientSecret := "", ""
 	if strings.TrimSpace(cfg.ClientID) == "" {
 		if registration := strings.TrimSpace(metadata.RegistrationEndpoint); registration != "" {
-			clientID, clientSecret, regErr := registerClient(loginCtx, httpClient, registration, redirectURI, cfg.Scopes)
+			registrationClient := httpClient
+			if metadata.protectRegistrationEndpoint {
+				registrationClient = protectedEndpointClient
+			}
+			clientID, clientSecret, regErr := registerClient(loginCtx, registrationClient, registration, redirectURI, cfg.Scopes)
 			if regErr != nil {
 				return StoredToken{}, regErr
 			}
 			cfg.ClientID = clientID
+			registeredClientID = clientID
 			if clientSecret != "" {
 				cfg.ClientSecret = clientSecret
+				registeredClientSecret = clientSecret
 			}
 		}
 	}
@@ -364,7 +530,7 @@ func Login(ctx context.Context, options LoginOptions) (StoredToken, error) {
 	}
 
 	flow := &authorizationFlow{
-		httpClient: httpClient,
+		httpClient: tokenClient,
 		metadata:   metadata,
 		config:     cfg,
 		pkce:       pkce,
@@ -382,31 +548,28 @@ func Login(ctx context.Context, options LoginOptions) (StoredToken, error) {
 		err  error
 	}
 	resultChan := make(chan callbackResult, 1)
-	server := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/callback" {
-				http.NotFound(w, r)
-				return
-			}
-			code, parseErr := flow.parseCallback(r.URL.Query())
-			if parseErr != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = io.WriteString(w, "Authorization failed. You may close this window.")
-			} else {
-				_, _ = io.WriteString(w, "Authorization complete. You may close this window.")
-			}
-			select {
-			case resultChan <- callbackResult{code: code, err: parseErr}:
-			default:
-			}
-		}),
-	}
-	go func() { _ = server.Serve(listener) }()
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
-	}()
+	// The shared callback server bounds header reads, force-closes a client
+	// still connected when shutdown runs out of time, and waits for Serve to
+	// return. The bare http.Server this used to build did none of that, so a
+	// client stalled mid-header outlived Login (#1028).
+	server := oauth.StartCallbackServer(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/callback" {
+			http.NotFound(w, r)
+			return
+		}
+		code, parseErr := flow.parseCallback(r.URL.Query())
+		if parseErr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, "Authorization failed. You may close this window.")
+		} else {
+			_, _ = io.WriteString(w, "Authorization complete. You may close this window.")
+		}
+		select {
+		case resultChan <- callbackResult{code: code, err: parseErr}:
+		default:
+		}
+	}))
+	defer server.Close()
 
 	open := options.OpenBrowser
 	if open == nil {
@@ -425,6 +588,14 @@ func Login(ctx context.Context, options LoginOptions) (StoredToken, error) {
 		if err != nil {
 			return StoredToken{}, err
 		}
+		// Persist only what config does not already carry, so refresh can reuse
+		// it without copying configured secrets into the token store.
+		if strings.TrimSpace(options.Config.TokenEndpoint) == "" {
+			token.TokenEndpoint = metadata.TokenEndpoint
+			token.ProtectedTokenEndpoint = metadata.protectTokenEndpoint
+		}
+		token.ClientID = registeredClientID
+		token.ClientSecret = registeredClientSecret
 		return token, nil
 	case <-loginCtx.Done():
 		return StoredToken{}, fmt.Errorf("timed out waiting for OAuth authorization callback: %w", loginCtx.Err())

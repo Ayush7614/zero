@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/agent"
-	"github.com/Gitlawb/zero/internal/sandbox"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/agent"
+	"github.com/Twigpine/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/tools"
 )
 
 var sandboxBlockForTest = sandbox.Block{
@@ -182,6 +182,9 @@ func TestConsecutiveExplorationResultsGroup(t *testing.T) {
 	}
 	if strings.Count(got, "Search") != 2 || !strings.Contains(got, "├ Search") || !strings.Contains(got, "└ Search") {
 		t.Fatalf("grouped exploration card should show both searches, got:\n%s", got)
+	}
+	if strings.Contains(got, "details") {
+		t.Fatalf("grouped exploration card must not advertise an inert details action, got:\n%s", got)
 	}
 }
 

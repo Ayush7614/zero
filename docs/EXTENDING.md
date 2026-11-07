@@ -102,13 +102,25 @@ The full format spec (frontmatter fields, tool scopes, prompt conventions) is in
 
 Skills are markdown instruction packs the agent can pull in on demand. Each skill is a directory containing a `SKILL.md`. Standalone project skill directories are not supported in this version (shared project-wide skills must go in `AGENTS.md` or as a hook). However, project plugins (section 6) may bundle skills, which are merged into the active run.
 
-Discovery root: `$ZERO_SKILLS_DIR` → `$XDG_DATA_HOME/zero/skills` → `~/.local/share/zero/skills/`. A missing directory is fine — Zero just reports "no skills".
+Discovery roots (earlier wins on name collisions):
+
+1. **Primary Zero dir** — `$ZERO_SKILLS_DIR` if set, else `$XDG_DATA_HOME/zero/skills`, else `~/.local/share/zero/skills/`
+2. **Shared multi-agent dir** — `~/.agents/skills/` when present (read-only discovery; never an install target)
+3. **Plugin skill roots** — skills bundled by active plugins (section 6)
+
+A missing directory is fine — Zero just omits it. Management commands (`zero skill add` / `zero skill remove`) always write to the primary Zero dir only; `list` / `info` search primary + `~/.agents/skills`. `skill info` reports lock source/hash when present and whether the on-disk `SKILL.md` has drifted from the recorded hash.
+
+For a skill installed since Zero started installing bundled files, `skill info` also reports drift in any file installed with it.
 
 ```text
-~/.local/share/zero/skills/
+~/.local/share/zero/skills/          # primary (install/remove target)
   run-benchmarks/
     SKILL.md
   write-changelog/
+    SKILL.md
+
+~/.agents/skills/                    # optional shared multi-agent root
+  shared-review/
     SKILL.md
 ```
 
@@ -126,9 +138,18 @@ description: Run the project's benchmark suite and summarize the deltas.
 3. Report any regression > 5% with the function name and the previous value.
 ```
 
-Only `name` and `description` are recognized in the frontmatter today. The `name` defaults to the directory name. Within a single skills root, duplicate names are resolved by lexicographic directory order. During an agent run, Zero loads the default skills directory before plugin skill roots; earlier roots win name collisions silently. Plugin-declared skills (section 6) are merged into the active agent run at plugin activation time, so bundled skills appear in the available skills list and can be loaded with the `skill` tool.
+Only `name` and `description` are recognized in the frontmatter today. The `name` defaults to the directory name. Within a single skills root, duplicate names are resolved by lexicographic directory order. Across roots, Zero loads the primary directory first, then `~/.agents/skills`, then plugin skill roots; earlier roots win name collisions. Plugin-declared skills (section 6) are merged into the active agent run at plugin activation time, so bundled skills appear in the available skills list and can be loaded with the `skill` tool.
 
-The `skill` core tool lets the agent load any discovered skill by name.
+The `skill` tool lets the agent load any discovered skill by name (primary, agents, or plugin).
+
+A skill can ship files beside its `SKILL.md`, in the [agentskills.io](https://agentskills.io/specification) layout: `scripts/`, `references/`, `assets/` or anything else the instructions refer to. `zero skill add` installs the whole skill directory, leaving out hidden entries such as `.git` and not following or copying symlinks (it lists any it skipped). A skill larger than 1,000 files or 32 MiB is refused. When the `skill` tool loads a skill that has such files, its output ends with the skill's directory and a list of the files, so instructions like "run `scripts/fill.py`" can be followed. Running a bundled script goes through the normal tool permissions; installing or loading a skill never runs anything.
+
+```text
+pdf/
+  SKILL.md
+  scripts/fill.py
+  references/form-fields.md
+```
 
 ## 4. Hooks
 
@@ -236,14 +257,63 @@ or use a new server name. OAuth tokens are bound to the resolved server identity
 so changing a server target can require `zero mcp oauth login <server>` again.
 OAuth server names ending in `.<32 hex chars>` are reserved for token storage.
 
+#### Built-in servers
+
+Zero seeds two MCP servers before your config is merged. Both show up in
+`zero mcp list`, and any field can be overridden in your user config.
+
+- `exa` (`https://mcp.exa.ai/mcp`) is on by default for keyless web search.
+  `zero mcp disable exa` turns it off.
+- `aimlapi` (`https://mcp.aimlapi.com/mcp`, the AI/ML API Toolbox, model
+  discovery, image/video/audio generation, chat, embeddings and balance tools)
+  is **off by default**, because its tool runs and generations are billed to
+  your AI/ML API balance. Turn it on with `zero mcp enable aimlapi`, which
+  writes only `"disabled": false` to your user config, and off again with
+  `zero mcp disable aimlapi`. A project config cannot turn it on.
+
+When `aimlapi` connects, Zero sends your AI/ML API key as
+`Authorization: Bearer <key>`. The key is resolved again on every request and
+is never written to `config.json`. With an aimlapi.com provider profile
+(`zero providers setup aimlapi`), the key is chosen in this order:
+
+1. An inline key on the profile (if set in config).
+2. Otherwise the environment variable named by the profile's `apiKeyEnv`
+   (the catalog default is `AIMLAPI_API_KEY`).
+3. Otherwise the key held in the credential store when the profile uses
+   `apiKeyStored`.
+
+When there is no aimlapi profile, Zero uses `AIMLAPI_API_KEY` alone. If both
+`AIMLAPI_API_KEY` and a stored profile key exist, step 2 wins over the store
+whenever the inline key is empty — MCP requests may bill the environment key's
+account, not the stored key.
+
+No automatic key is sent when an aimlapi profile, or any profile reading
+`AIMLAPI_API_KEY`, uses a base URL other than `https://api.aimlapi.com/v1`, or
+when `AIMLAPI_INFERENCE_URL` is overridden, because that credential may belong
+to a proxy. No key is sent when the resolved value is not a single token (for
+example a comma- or newline-separated pool), when you set your own
+non-empty `Authorization` header, when the server uses `"auth": "oauth"`, or
+when project config touched the server. Without a key the server answers 401.
+To sign in with your aimlapi.com account instead, set `"auth": "oauth"` on the
+server and run `zero mcp oauth login aimlapi`.
+
+Every request to exactly `https://mcp.aimlapi.com` (https, default port,
+whatever the server is named, including one you add by hand) also carries the
+attribution headers `X-AIMLAPI-Source: agent/zero` and `X-AIMLAPI-Partner-ID`,
+and gets the key under the rules above. Other MCP servers never receive these
+headers or the key.
+
 ### As a server — expose Zero's tools to another agent
 
 ```bash
 zero serve --mcp
+zero serve --mcp -C /path/to/workspace
+zero serve --mcp --add-dir /path/to/extra
 ```
 
 The server speaks MCP over stdio. Configure it from the receiving side as a `stdio` server whose command is `zero serve --mcp`.
 
+`-C/--cwd` sets the workspace root exposed as MCP resources and used by core tools. `--add-dir` (repeatable) widens that resource/tool scope beyond the workspace without granting the sandbox temp roots used by interactive runs.
 ## 6. Plugins
 
 A plugin is a self-contained directory that bundles tools, hooks, and skills for one capability. Plugins live at:
@@ -276,10 +346,13 @@ Install and manage:
 ```bash
 zero plugins add ./github-pr-review      # copy into ~/.config/zero/plugins/ or ./.zero/plugins/
 zero plugins list
+zero plugins info github-pr-review       # show manifest path, enabled state, lock metadata
+zero plugins disable github-pr-review   # sets "enabled": false in plugin.json
+zero plugins enable github-pr-review    # sets "enabled": true in plugin.json
 zero plugins remove github-pr-review    # alias: rm
 ```
 
-A plugin is enabled by being present in the plugins directory and disabled by removing it (or by the user setting `"enabled": false` in its `plugin.json`). Plugins are not enabled or disabled by a CLI subcommand today.
+A plugin is active when it is present under a plugins directory and its `plugin.json` has `"enabled": true` (the default when the field is omitted). Use `zero plugins disable <id>` / `zero plugins enable <id>` to toggle that field without removing the plugin. Pass `--user` to target only user plugins and ignore `./.zero/plugins`; without it, a project plugin with the same id takes precedence. The toggle edits the `enabled` value in place — the rest of the manifest keeps its formatting, field order, and numeric literals — and serializes with `plugins add` / `plugins remove` on the same plugins root. Zero reads plugins when it starts, so the change applies to the next `zero exec` run or interactive session; an interactive session that is already running keeps the plugin tools, hooks, and skills it started with until you restart it.
 
 Plugin commands run with the plugin directory as their working directory. Use relative paths; the loader resolves them at activation time.
 

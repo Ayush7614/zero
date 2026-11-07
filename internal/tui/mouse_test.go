@@ -8,8 +8,10 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/terminalpet"
+	"github.com/Twigpine/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 func TestMouseClickSelectsThenAppliesCommandSuggestionRow(t *testing.T) {
@@ -248,6 +250,27 @@ func TestComposerMouseClickMovesCursor(t *testing.T) {
 	}
 	if text := next.selectedComposerText(); text != "" {
 		t.Fatalf("composer click should not select text, got %q", text)
+	}
+}
+
+func TestComposerMouseClickMovesCursorBelowImageThumbnail(t *testing.T) {
+	m := mouseTestModel()
+	m.attachmentRenderers = []*terminalpet.ImageRenderer{terminalpet.NewImageRenderer(terminalpet.ImageSupport{Protocol: terminalpet.ImageProtocolKitty})}
+	m.pendingImages = []zeroruntime.ImageBlock{previewImageBlock(t)}
+	m.refreshPendingImageThumbnail()
+	m.input.SetValue("hello world")
+
+	width := m.chatColumnWidth()
+	frame := m.scrollableTranscriptFrame(m.pinnedTitleBar(width), m.footerView(width))
+	x := frame.composerRect.x + 2 + lipgloss.Width(composerVisualLinePrefix(m.input, true)) + 5
+	y := frame.composerRect.y + 1 + attachmentPreviewRows
+	updated, cmd := m.Update(testMouseClick(tea.MouseLeft, x, y))
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatal("composer click should not return a command")
+	}
+	if got := next.currentComposerState().cursor; got != 5 {
+		t.Fatalf("composer cursor below thumbnail = %d, want 5", got)
 	}
 }
 
@@ -985,13 +1008,60 @@ func composerMousePoint(t *testing.T, m model, column int) (int, int) {
 	if frame.composerRect.height <= 0 {
 		t.Fatalf("expected visible composer rect, frame=%#v", frame)
 	}
-	contentY := 1
-	if renderAttachmentChips(m.pendingImageLabels, m.pendingDocuments) != "" {
-		contentY++
-	}
+	contentY := 1 + m.attachmentComposerPrefixRows(width)
 	x := frame.composerRect.x + 2 + lipgloss.Width(composerVisualLinePrefix(m.input, true)) + column
 	y := frame.composerRect.y + contentY
 	return x, y
+}
+
+func TestModelPickerMouseUsesRenderedRowBoundaries(t *testing.T) {
+	for _, line := range []int{6, 7} {
+		m := mouseTestModel()
+		m.width, m.height = 30, 40
+		m.picker = &commandPicker{kind: pickerModel, items: []pickerItem{
+			{Group: "Recent", Label: "model-subscription-one", Value: "one", OwnerLabel: "subscription-profile"},
+			{Group: "Recent", Label: "model-subscription-two", Value: "two", OwnerLabel: "subscription-profile"},
+		}}
+		overlay := m.modelPickerOverlay(30)
+		rect := m.overlayMouseRect(len(viewLines(overlay)), 30)
+		// Border/search/rule/header occupy lines 0–3; each model has two lines.
+		target, ok := m.selectModelPickerAtMouse(testMouseClick(tea.MouseLeft, 15, rect.y+line))
+		if !ok || target.Value != "two" {
+			t.Fatalf("line %d selected %#v, ok=%v; want second model", line, target, ok)
+		}
+		if _, ok := m.selectModelPickerAtMouse(testMouseClick(tea.MouseLeft, 15, rect.y+3)); ok {
+			t.Fatal("group header must not select a model")
+		}
+	}
+}
+
+func TestModelPickerFitsMultilineRowsToViewport(t *testing.T) {
+	for _, selected := range []int{0, 5, 9} {
+		m := mouseTestModel()
+		m.width, m.height = 30, 24
+		m.picker = &commandPicker{kind: pickerModel, selected: selected}
+		for i := 0; i < 10; i++ {
+			m.picker.items = append(m.picker.items, pickerItem{Group: "Recent", Label: "model-subscription-" + string(rune('a'+i)), OwnerLabel: "work-subscription-provider-east", OwnerNumber: 1})
+		}
+		overlay := m.modelPickerOverlay(30)
+		frame := m.scrollableTranscriptFrame(m.pinnedTitleBar(30), m.footerView(30))
+		if got := len(viewLines(overlay)); got > frame.bodyHeight {
+			t.Fatalf("selected=%d: overlay height %d exceeds body %d", selected, got, frame.bodyHeight)
+		}
+		plain := plainRender(t, overlay)
+		assertContains(t, plain, "❯ "+m.picker.items[selected].Label)
+		assertContains(t, plain, "Enter select")
+		rect := m.overlayMouseRect(len(viewLines(overlay)), 30)
+		for line, text := range strings.Split(plain, "\n") {
+			if !strings.Contains(text, "❯ ") {
+				continue
+			}
+			target, ok := m.selectModelPickerAtMouse(testMouseClick(tea.MouseLeft, 15, rect.y+line+1))
+			if !ok || target.Index != selected {
+				t.Fatalf("scrolled owner-line click selected %#v, ok=%v; want %d", target, ok, selected)
+			}
+		}
+	}
 }
 
 func mouseTestModel() model {

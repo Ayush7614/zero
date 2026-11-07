@@ -1,13 +1,19 @@
 package agent
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/testutil"
 )
+
+// isolatedUserDirsRoot is where TestMain points every per-user directory.
+var isolatedUserDirsRoot string
 
 // TestMain points userConfigDirForPrompt at an empty, package-wide temp
 // directory for every test in this package. Without this, buildSystemPrompt
@@ -17,26 +23,68 @@ import (
 // across contributor machines. Tests that specifically exercise user
 // guidelines stub userConfigDirForPrompt themselves via
 // withSystemPromptTestUserConfigDir(Func) and restore this default on cleanup.
+//
+// It also points every per-user directory root at the same temp directory:
+// sandboxed tool runs keep their runtime state and lease files under the user
+// cache dir, so without this they land in the developer's real cache.
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "zero-agent-tests-*")
 	if err != nil {
 		panic(err)
 	}
+	isolatedUserDirsRoot = dir
+	restore, err := testutil.IsolateUserDirs(dir)
+	if err != nil {
+		os.RemoveAll(dir)
+		panic(err)
+	}
 	userConfigDirForPrompt = func() (string, error) { return dir, nil }
 	code := m.Run()
+	if err := restore(); err != nil {
+		fmt.Fprintln(os.Stderr, "agent tests: restore user dirs:", err)
+		code = 1
+	}
 	os.RemoveAll(dir)
 	os.Exit(code)
 }
 
+// Guards TestMain: the per-user directories the package can read or write
+// must resolve inside the isolated root on every OS.
+func TestUserDirsAreIsolatedFromTheDeveloperHome(t *testing.T) {
+	if isolatedUserDirsRoot == "" {
+		t.Fatal("TestMain did not record an isolated root")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	userConfig, err := config.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, dir := range map[string]string{"home": home, "config": userConfig, "cache": cache} {
+		if !testutil.PathWithin(isolatedUserDirsRoot, dir) {
+			t.Errorf("%s dir %q is outside the isolated root %q", name, dir, isolatedUserDirsRoot)
+		}
+	}
+}
+
 func TestCoreSystemPromptIncludesCodingQualityRules(t *testing.T) {
-	prompt := strings.ToLower(buildSystemPrompt(Options{}))
+	prompt := strings.Join(strings.Fields(strings.ToLower(buildSystemPrompt(Options{}))), " ")
+	if strings.Contains(prompt, "clickable file paths") {
+		t.Fatalf("system prompt must not claim inline-code file paths are clickable: %s", prompt)
+	}
 
 	for _, want := range []string{
 		"read-before-edit",
 		"inspect the target file",
 		"plan then act",
 		"choose the narrowest tool",
-		"prefer edit_file or apply_patch",
+		"for edits to existing files, use edit_file",
 		"verify after edits",
 		"honor the active permission mode",
 		"avoid broad refactors",
@@ -44,10 +92,27 @@ func TestCoreSystemPromptIncludesCodingQualityRules(t *testing.T) {
 		"do not recognize",
 		"scaled to the work",
 		"comment density",
+		"skip it for bounded changes in one component",
+		"do not read both unless a new need for exact content appears",
+		"combine compatible commands when diagnostics stay useful",
+		"do not invent a parallel flow",
+		"a successful native patch confirms the edit",
+		"once the required behavior passes validation, stop",
+		"do not look them up solely for the final summary",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("expected core system prompt to include %q, got:\n%s", want, buildSystemPrompt(Options{}))
 		}
+	}
+}
+
+func TestTransientSystemPromptIsIncludedOnlyWhenProvided(t *testing.T) {
+	const transient = "Handle this peer request under the current session policy."
+	if prompt := buildSystemPrompt(Options{}); strings.Contains(prompt, transient) {
+		t.Fatal("ordinary system prompt unexpectedly contains transient instructions")
+	}
+	if prompt := buildSystemPrompt(Options{TransientSystemPrompt: transient}); !strings.Contains(prompt, transient) {
+		t.Fatalf("transient instructions missing from system prompt:\n%s", prompt)
 	}
 }
 

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
+
+	"github.com/Twigpine/zero/internal/gitsafe"
 )
 
 type PrStatus string
@@ -149,10 +151,6 @@ func (s *PrService) detect(ctx context.Context) PrState {
 	return PrState{Status: PrNotFound}
 }
 
-func WatchPRState(service *PrService, onChange func(PrState)) func() {
-	return WatchPRStateContext(context.Background(), service, onChange)
-}
-
 func WatchPRStateContext(ctx context.Context, service *PrService, onChange func(PrState)) func() {
 	if service == nil || onChange == nil {
 		return func() {}
@@ -237,16 +235,6 @@ func detectGitLabMR(ctx context.Context, cwd string, run prCommandRunner) (PrSta
 	return state, true
 }
 
-func GetLocalDiffStats(baseBranch string) (additions int, deletions int, err error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return 0, 0, err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), prCommandTimeout)
-	defer cancel()
-	return getLocalDiffStats(ctx, cwd, baseBranch, defaultPRCommandRunner)
-}
-
 func getLocalDiffStats(ctx context.Context, cwd string, baseBranch string, run prCommandRunner) (int, int, error) {
 	baseBranch = strings.TrimSpace(baseBranch)
 	if baseBranch == "" {
@@ -257,7 +245,7 @@ func getLocalDiffStats(ctx context.Context, cwd string, baseBranch string, run p
 	if err != nil {
 		mergeBase = originBase
 	}
-	output, err := run(ctx, cwd, "git", "diff", "--numstat", strings.TrimSpace(mergeBase))
+	output, err := run(ctx, cwd, "git", "diff", "--numstat", "--ignore-submodules=dirty", strings.TrimSpace(mergeBase))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -304,9 +292,21 @@ func jsonScalarString(raw json.RawMessage) string {
 }
 
 func defaultPRCommandRunner(ctx context.Context, cwd string, name string, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, name, args...)
-	if strings.TrimSpace(cwd) != "" {
-		command.Dir = cwd
+	var command *exec.Cmd
+	if name == "git" {
+		// Every git call the TUI makes on its own comes through here (the files
+		// sweep and the pull request diffstat), so the repository being shown
+		// cannot make them run a program.
+		safe, err := gitsafe.Command(ctx, cwd, args...)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", name, err)
+		}
+		command = safe
+	} else {
+		command = exec.CommandContext(ctx, name, args...)
+		if strings.TrimSpace(cwd) != "" {
+			command.Dir = cwd
+		}
 	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

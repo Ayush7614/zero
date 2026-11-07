@@ -15,11 +15,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/providercatalog"
-	"github.com/Gitlawb/zero/internal/providers"
-	"github.com/Gitlawb/zero/internal/providers/providerio"
-	"github.com/Gitlawb/zero/internal/redaction"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/providercatalog"
+	"github.com/Twigpine/zero/internal/providers"
+	"github.com/Twigpine/zero/internal/providers/providerio"
+	"github.com/Twigpine/zero/internal/proxydial"
+	"github.com/Twigpine/zero/internal/redaction"
 )
 
 type Status string
@@ -46,12 +47,13 @@ const (
 const defaultTimeout = 5 * time.Second
 
 type Options struct {
-	Profile      config.ProviderProfile
-	Connectivity bool
-	HTTPClient   *http.Client
-	Resolver     Resolver
-	Timeout      time.Duration
-	UserAgent    string
+	Profile       config.ProviderProfile
+	Connectivity  bool
+	HTTPClient    *http.Client
+	Resolver      Resolver
+	OAuthResolver providerio.TokenResolver
+	Timeout       time.Duration
+	UserAgent     string
 }
 
 type Resolver interface {
@@ -207,11 +209,26 @@ func Probe(ctx context.Context, options Options) Result {
 		"providerKind": metadata.ProviderKind,
 	}, profile))
 
-	if credentialRequired(profile, metadata.ProviderKind) && !hasCredential(profile) {
+	oauthConfigured := options.OAuthResolver != nil
+	if oauthConfigured {
+		var resolveErr error
+		profile, oauthConfigured, resolveErr = profileWithOAuthCredential(ctx, profile, options.OAuthResolver, false)
+		if resolveErr != nil {
+			result.add(check("provider.auth", "Provider auth", StatusFail, CategoryAuth, "Provider OAuth credential could not be resolved: "+resolveErr.Error(), map[string]any{
+				"oauthLogin": true,
+			}, profile))
+			return result.finalize()
+		}
+	}
+	if credentialRequired(profile, metadata.ProviderKind) && !hasCredential(profile) && !oauthConfigured {
 		result.add(check("provider.auth", "Provider auth", StatusFail, CategoryAuth, fmt.Sprintf("Provider %s requires API credentials.", providerName(profile)), credentialDetails(profile), profile))
 		return result.finalize()
 	}
-	if hasCredential(profile) {
+	if oauthConfigured {
+		result.add(check("provider.auth", "Provider auth", StatusPass, CategoryAuth, fmt.Sprintf("Provider %s has OAuth credentials configured.", providerName(profile)), map[string]any{
+			"oauthLogin": true,
+		}, profile))
+	} else if hasCredential(profile) {
 		result.add(check("provider.auth", "Provider auth", StatusPass, CategoryAuth, fmt.Sprintf("Provider %s has credentials configured.", providerName(profile)), credentialDetails(profile), profile))
 	} else {
 		result.add(check("provider.auth", "Provider auth", StatusPass, CategoryAuth, fmt.Sprintf("Provider %s does not require API credentials.", providerName(profile)), credentialDetails(profile), profile))
@@ -286,9 +303,35 @@ func connectivityCheck(ctx context.Context, profile config.ProviderProfile, kind
 	if err != nil {
 		return classifyTransportError(err, profile)
 	}
-	defer func() {
-		_ = response.Body.Close()
-	}()
+	defer func(body io.ReadCloser) {
+		_ = body.Close()
+	}(response.Body)
+	if response.StatusCode == http.StatusUnauthorized && options.OAuthResolver != nil {
+		refreshed, ok, refreshErr := profileWithOAuthCredential(requestCtx, options.Profile, options.OAuthResolver, true)
+		if refreshErr != nil {
+			return check("provider.connectivity", "Provider connectivity", StatusFail, CategoryAuth, "Provider OAuth credential refresh failed: "+refreshErr.Error(), map[string]any{
+				"statusCode": response.StatusCode,
+			}, profile)
+		}
+		if ok {
+			_ = response.Body.Close()
+			profile = refreshed
+			request, allowLoopbackOrPrivate, err = healthRequest(requestCtx, profile, kind, options)
+			if err != nil {
+				return check("provider.connectivity", "Provider connectivity", StatusFail, CategoryConfig, err.Error(), nil, profile)
+			}
+			if options.HTTPClient == nil {
+				client = newConnectivityClient(timeout, options.Resolver, sensitiveAuthHeaderNames(profile, kind), allowLoopbackOrPrivate)
+			}
+			response, err = client.Do(request)
+			if err != nil {
+				return classifyTransportError(err, profile)
+			}
+			defer func(body io.ReadCloser) {
+				_ = body.Close()
+			}(response.Body)
+		}
+	}
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
 	if err != nil {
@@ -318,6 +361,23 @@ func connectivityCheck(ctx context.Context, profile config.ProviderProfile, kind
 		"statusCode": response.StatusCode,
 		"endpoint":   request.URL.String(),
 	}, profile)
+}
+
+func profileWithOAuthCredential(ctx context.Context, profile config.ProviderProfile, resolver providerio.TokenResolver, forceRefresh bool) (config.ProviderProfile, bool, error) {
+	if resolver == nil {
+		return profile, false, nil
+	}
+	header, value, ok, err := resolver(ctx, forceRefresh)
+	if err != nil || !ok {
+		return profile, false, err
+	}
+	if strings.TrimSpace(header) == "" {
+		header = "Authorization"
+	}
+	profile.AuthHeader = header
+	profile.AuthScheme = ""
+	profile.AuthHeaderValue = value
+	return profile, true, nil
 }
 
 func healthRequest(ctx context.Context, profile config.ProviderProfile, kind config.ProviderKind, options Options) (*http.Request, bool, error) {
@@ -391,7 +451,7 @@ func validateEndpoint(ctx context.Context, endpoint string, resolver Resolver, a
 		return endpointSafetyError{message: "provider connectivity URL is unsafe: localhost hosts are blocked"}
 	}
 	if addr, err := netip.ParseAddr(normalized); err == nil {
-		if reason := blockedAddrReason(addr); reason != "" && !(allowLoopbackOrPrivate && (addr.IsLoopback() || addr.IsPrivate())) {
+		if reason := blockedAddrReason(addr); reason != "" && (!allowLoopbackOrPrivate || (!addr.IsLoopback() && !addr.IsPrivate())) {
 			return endpointSafetyError{message: "provider connectivity URL is unsafe: " + reason}
 		}
 		return nil
@@ -407,7 +467,7 @@ func validateEndpoint(ctx context.Context, endpoint string, resolver Resolver, a
 		return endpointSafetyError{message: "provider connectivity host resolved to no addresses"}
 	}
 	for _, addr := range addrs {
-		if reason := blockedAddrReason(addr); reason != "" && !(allowLoopbackOrPrivate && (addr.IsLoopback() || addr.IsPrivate())) {
+		if reason := blockedAddrReason(addr); reason != "" && (!allowLoopbackOrPrivate || (!addr.IsLoopback() && !addr.IsPrivate())) {
 			return endpointSafetyError{message: "provider connectivity URL is unsafe: " + reason}
 		}
 	}
@@ -459,9 +519,15 @@ func newConnectivityClient(timeout time.Duration, resolver Resolver, sensitiveHe
 		transport = &http.Transport{}
 	}
 	transport.DialContext = safeDialContext(resolver, allowLoopbackOrPrivate)
+	// WRAPPED, SO THE DIALER LEARNS THE ROUTE THIS TRANSPORT CHOSE. The wrapper
+	// records the proxy selected for each request on that request, and the
+	// dialer reads it back on the dial that request causes; installing the bare
+	// transport instead would leave a proxied dial looking like a loopback
+	// target and fail the probe (#569). The cloned default transport already
+	// reads HTTPS_PROXY and friends; nothing new is enabled.
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: transport,
+		Transport: proxydial.Wrap(transport),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxConnectivityRedirects {
 				return fmt.Errorf("provider connectivity exceeded %d redirects", maxConnectivityRedirects)
@@ -524,12 +590,23 @@ func sensitiveAuthHeaderNames(profile config.ProviderProfile, kind config.Provid
 func safeDialContext(resolver Resolver, allowLoopbackOrPrivate bool) func(context.Context, string, string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		// THE PROXY IS NOT THE TARGET. With HTTPS_PROXY set to a local forward
+		// proxy, the transport dials the proxy first and tunnels the request
+		// through it, and this dialer used to refuse that dial as a loopback
+		// address: "proxyconnect tcp: ... loopback hosts are blocked" for a
+		// request whose real target had already been validated (#569). The
+		// target validation is unchanged; only the dial the transport opens to
+		// the proxy it picked for this very request is let past the guard, and a
+		// direct dial is checked as it always was.
+		if proxydial.IsProxyDial(ctx) {
+			return dialer.DialContext(ctx, network, address)
+		}
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
 			return nil, err
 		}
 		if addr, parseErr := netip.ParseAddr(host); parseErr == nil {
-			if reason := blockedAddrReason(addr); reason != "" && !(allowLoopbackOrPrivate && (addr.IsLoopback() || addr.IsPrivate())) {
+			if reason := blockedAddrReason(addr); reason != "" && (!allowLoopbackOrPrivate || (!addr.IsLoopback() && !addr.IsPrivate())) {
 				return nil, endpointSafetyError{message: "provider connectivity URL is unsafe: " + reason}
 			}
 			return dialer.DialContext(ctx, network, address)
@@ -542,7 +619,7 @@ func safeDialContext(resolver Resolver, allowLoopbackOrPrivate bool) func(contex
 			return nil, endpointSafetyError{message: "provider connectivity host resolved to no addresses"}
 		}
 		for _, addr := range addrs {
-			if reason := blockedAddrReason(addr); reason != "" && !(allowLoopbackOrPrivate && (addr.IsLoopback() || addr.IsPrivate())) {
+			if reason := blockedAddrReason(addr); reason != "" && (!allowLoopbackOrPrivate || (!addr.IsLoopback() && !addr.IsPrivate())) {
 				return nil, endpointSafetyError{message: "provider connectivity URL is unsafe: " + reason}
 			}
 		}
@@ -748,6 +825,9 @@ func redact(message string, profile config.ProviderProfile) string {
 
 func providerSecrets(profile config.ProviderProfile) []string {
 	secrets := []string{profile.APIKey, profile.AuthHeaderValue}
+	if fields := strings.Fields(profile.AuthHeaderValue); len(fields) == 2 {
+		secrets = append(secrets, fields[1])
+	}
 	for _, value := range profile.CustomHeaders {
 		if strings.TrimSpace(value) != "" {
 			secrets = append(secrets, value)

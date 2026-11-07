@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Gitlawb/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/modelregistry"
 )
 
 // escalateToModelMetaKey is the result-metadata key the agent loop reads to
@@ -57,6 +57,8 @@ func newEscalateModelTool(registry modelregistry.Registry) escalateModelTool {
 				Reason:          "Requests a mid-run switch to a stronger model; the agent loop performs the switch.",
 				AdvertiseInAuto: true,
 			},
+			// Requests mid-run model switch; session-bound.
+			capabilities: ToolCapabilities{Effect: EffectInteractive, ThreadSafe: false},
 		},
 		registry: registry,
 	}

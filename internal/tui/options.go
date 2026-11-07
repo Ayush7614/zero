@@ -5,36 +5,43 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/Gitlawb/zero/internal/agent"
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/mcp"
-	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/providerhealth"
-	"github.com/Gitlawb/zero/internal/providermodeldiscovery"
-	"github.com/Gitlawb/zero/internal/sandbox"
-	"github.com/Gitlawb/zero/internal/sessions"
-	"github.com/Gitlawb/zero/internal/skills"
-	"github.com/Gitlawb/zero/internal/tools"
-	"github.com/Gitlawb/zero/internal/usage"
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/agent"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/mcp"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/peermsg"
+	"github.com/Twigpine/zero/internal/providerhealth"
+	"github.com/Twigpine/zero/internal/providermodeldiscovery"
+	"github.com/Twigpine/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/sessions"
+	"github.com/Twigpine/zero/internal/skills"
+	"github.com/Twigpine/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/usage"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
 // Options configures the reusable Zero terminal UI shell.
 type Options struct {
-	Cwd                         string
-	Version                     string // CLI build version, shown on the home screen; empty hides it
-	UserConfigPath              string
-	DoctorUserConfigPath        string
-	ProjectConfigPath           string
-	ProviderName                string
-	ModelName                   string
-	ProviderProfile             config.ProviderProfile
-	SavedProviders              []config.ProviderProfile // all configured providers, for the /model multi-provider list
-	FavoriteModels              []string
-	RecentModels                []config.RecentModelEntry
-	RecapsEnabled               bool
+	ModelRPM             *zeroruntime.ModelRPMLimiter
+	Cwd                  string
+	Version              string // CLI build version, shown on the home screen; empty hides it
+	UserConfigPath       string
+	DoctorUserConfigPath string
+	ProjectConfigPath    string
+	ProviderName         string
+	ModelName            string
+	ProviderProfile      config.ProviderProfile
+	SavedProviders       []config.ProviderProfile // all configured providers, for the /model multi-provider list
+	FavoriteModels       []string
+	RecentModels         []config.RecentModelEntry
+	RecapsEnabled        bool
+	// CompactionModel is the resolved preferences.compactionModel value; see
+	// providers.CompactionModelID for how it combines with the env override
+	// and the curated cheap defaults.
+	CompactionModel             string
 	Provider                    zeroruntime.Provider
 	NewProvider                 func(config.ProviderProfile) (zeroruntime.Provider, error)
+	NewTurnSessionProvider      func(config.ProviderProfile, zeroruntime.Provider) zeroruntime.TurnSessionProvider
 	ProbeProviderHealth         func(context.Context, providerhealth.Options) providerhealth.Result
 	DiscoverProviderModels      func(context.Context, config.ProviderProfile) ([]providermodeldiscovery.Model, error)
 	DiscoverOllamaContextWindow func(ctx context.Context, baseURL string, model string) (int, error)
@@ -42,16 +49,21 @@ type Options struct {
 	PrepareRunCompletionWarning func()
 	RunCompletionWarning        func() string
 	Registry                    *tools.Registry
-	SessionStore                *sessions.Store
-	SandboxStore                *sandbox.GrantStore
-	MCPConfig                   config.MCPConfig
-	MCPPermissionStore          *mcp.PermissionStore
-	MCPTokenStore               *mcp.TokenStore
-	MCPCommand                  func(context.Context, []string) MCPCommandResult
-	SandboxSetupCommand         func(context.Context) SandboxSetupCommandResult
-	UsageTracker                *usage.Tracker
-	SessionCompactor            SessionCompactor
-	PrService                   *PrService
+	// AwaitToolReadiness gives prompt-critical integration startup a bounded
+	// chance to publish its tools before this turn snapshots the registry. The
+	// wait runs inside the asynchronous agent command, so the TUI stays usable.
+	AwaitToolReadiness  func(context.Context)
+	SessionStore        *sessions.Store
+	SandboxStore        *sandbox.GrantStore
+	MCPConfig           config.MCPConfig
+	MCPPermissionStore  *mcp.PermissionStore
+	MCPTokenStore       *mcp.TokenStore
+	MCPCommand          func(context.Context, []string) MCPCommandResult
+	SandboxSetupCommand func(context.Context) SandboxSetupCommandResult
+	UsageTracker        *usage.Tracker
+	SessionCompactor    SessionCompactor
+	PrService           *PrService
+	PeerService         *peermsg.Service
 
 	AgentOptions agent.Options
 	// LoadSkills returns the installed skills (default skills dir merged with any
@@ -59,7 +71,13 @@ type Options struct {
 	// invocation. Called lazily per use so newly installed skills are picked up
 	// without a restart. Nil means the session has no skills wiring (skills stay
 	// model-pulled via the skill tool only).
-	LoadSkills      func() []skills.Skill
+	LoadSkills func() []skills.Skill
+	// AllowEscalation opts this session into mid-run model escalation, set from
+	// --allow-escalation. It wires the model switchers onto every turn's options;
+	// the escalate_model tool itself is registered by the caller on the same flag.
+	// Both halves are required: the tool without the switchers is inert, and the
+	// switchers without the tool are unreachable.
+	AllowEscalation bool
 	PermissionMode  agent.PermissionMode
 	ReasoningEffort modelregistry.ReasoningEffort
 	ResponseStyle   string
@@ -70,7 +88,10 @@ type Options struct {
 	// SavedTheme is the theme persisted in user config (Preferences.Theme). Applied
 	// at startup below --theme and ZERO_THEME, so a /theme choice survives restart.
 	SavedTheme string
-	UserAgent  string
+	// SavedPet is the persisted terminal companion id. Empty means no pet has
+	// been selected yet; "disabled" records an explicit opt-out.
+	SavedPet  string
+	UserAgent string
 
 	// Notify configures completion / awaiting-input notifications.
 	Notify config.NotifyConfig
@@ -78,6 +99,11 @@ type Options struct {
 	// KeyBindings configures remappable TUI keybindings. An empty/zero
 	// KeyBindingsConfig means "use built-in defaults" for each action.
 	KeyBindings config.KeyBindingsConfig
+
+	// StartupNotices are shown as system notices when the session opens: facts
+	// about the session the user should see before the first prompt, decided by
+	// the caller that built it. Blank entries are skipped.
+	StartupNotices []string
 
 	// STT configures speech-to-text dictation (§ docs/dictation.md).
 	STT config.STTConfig

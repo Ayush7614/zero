@@ -17,6 +17,7 @@ const (
 	commandPermissions
 	commandPS
 	commandStop
+	commandAttach
 	commandSandboxSetup
 	commandProvider
 	commandModel
@@ -27,29 +28,35 @@ const (
 	commandPlan
 	commandSearch
 	commandResume
-	commandRetitle
+	commandRename
 	commandSpec
 	commandInit
 	commandCompact
 	commandRewind
 	commandEffort
+	commandFast
 	commandStyle
 	commandTheme
+	commandNotify
 	commandTranscript
 	commandBash
 	commandImage
 	commandAddDir
 	commandSelfCorrect
 	commandTurns
+	commandProfile
 	commandRetry
 	commandEdit
 	commandCopy
 	commandExport
 	commandNew
+	commandBTW
 	commandSkills
 	commandLoop
+	commandGoal
 	commandVoice
 	commandSTTModel
+	commandPets
 	commandUnknown
 )
 
@@ -104,14 +111,14 @@ var commandDefinitions = []commandDefinition{
 		name:        "/voice",
 		usage:       "/voice",
 		group:       commandGroupRuntime,
-		description: "Toggle voice mode (hold Space to dictate).",
+		description: "Toggle voice mode (" + voiceCaptureUsage + ").",
 		kind:        commandVoice,
 	},
 	{
 		name:        "/plan",
-		usage:       "/plan",
+		usage:       "/plan [status|on|off]",
 		group:       commandGroupSession,
-		description: "Show planning mode status.",
+		description: "Show plan status, or enter/exit read-only planning mode.",
 		kind:        commandPlan,
 	},
 	{
@@ -134,6 +141,13 @@ var commandDefinitions = []commandDefinition{
 		group:       commandGroupRuntime,
 		description: "Stop running background terminal sessions.",
 		kind:        commandStop,
+	},
+	{
+		name:        "/attach",
+		usage:       "/attach [session_id]",
+		group:       commandGroupRuntime,
+		description: "Type directly into a running interactive terminal session.",
+		kind:        commandAttach,
 	},
 	{
 		name:        "/sandbox-setup",
@@ -192,6 +206,13 @@ var commandDefinitions = []commandDefinition{
 		kind:        commandNew,
 	},
 	{
+		name:        "/btw",
+		usage:       "/btw [question]",
+		group:       commandGroupSession,
+		description: "Open an isolated side conversation; run /btw again to return.",
+		kind:        commandBTW,
+	},
+	{
 		name:        "/search",
 		aliases:     []string{"/find"},
 		usage:       "/search <query>",
@@ -216,11 +237,11 @@ var commandDefinitions = []commandDefinition{
 		kind:        commandResume,
 	},
 	{
-		name:        "/retitle",
-		usage:       "/retitle",
+		name:        "/rename",
+		usage:       "/rename [title]",
 		group:       commandGroupSession,
-		description: "Generate concise titles for resumable sessions.",
-		kind:        commandRetitle,
+		description: "Rename the current session (no arg opens an editor).",
+		kind:        commandRename,
 	},
 	{
 		name:        "/spec",
@@ -252,6 +273,7 @@ var commandDefinitions = []commandDefinition{
 	},
 	{
 		name:        "/rewind",
+		aliases:     []string{"/undo"},
 		usage:       "/rewind [latest|<sequence>]",
 		group:       commandGroupSession,
 		description: "Restore workspace files to a checkpoint and truncate the session.",
@@ -259,10 +281,17 @@ var commandDefinitions = []commandDefinition{
 	},
 	{
 		name:        "/effort",
-		usage:       "/effort [list|low|medium|high|auto]",
+		usage:       "/effort [list|level|auto]",
 		group:       commandGroupModel,
 		description: "Show or set reasoning effort for supported models.",
 		kind:        commandEffort,
+	},
+	{
+		name:        "/fast",
+		usage:       "/fast",
+		group:       commandGroupModel,
+		description: "Toggle fast mode for supported ChatGPT subscription models.",
+		kind:        commandFast,
 	},
 	{
 		name:        "/style",
@@ -285,6 +314,13 @@ var commandDefinitions = []commandDefinition{
 		group:       commandGroupSession,
 		description: "Show or set the per-run tool-turn budget for this session (raise it for long multi-step tasks).",
 		kind:        commandTurns,
+	},
+	{
+		name:        "/profile",
+		usage:       "/profile [status|balanced|fast|thorough]",
+		group:       commandGroupSession,
+		description: "Show or switch the execution profile for the next run (loop posture: turn budget, effort, self-correction, escalation; model selection is unchanged).",
+		kind:        commandProfile,
 	},
 	{
 		name:        "/retry",
@@ -322,11 +358,26 @@ var commandDefinitions = []commandDefinition{
 		kind:        commandLoop,
 	},
 	{
+		name:        "/goal",
+		usage:       "/goal [--tokens N] <objective> | status | pause | resume | edit | clear",
+		group:       commandGroupSession,
+		description: "Create and pursue one persistent objective for this session.",
+		kind:        commandGoal,
+	},
+	{
 		name:        "/help",
 		usage:       "/help",
 		group:       commandGroupMeta,
 		description: "Show available commands.",
 		kind:        commandHelp,
+	},
+	{
+		name:        "/pets",
+		aliases:     []string{"/pet"},
+		usage:       "/pets [name|off]",
+		group:       commandGroupMeta,
+		description: "Choose, preview, or hide a terminal companion.",
+		kind:        commandPets,
 	},
 	{
 		name:        "/doctor",
@@ -357,6 +408,13 @@ var commandDefinitions = []commandDefinition{
 		group:       commandGroupSession,
 		description: "Pick a color theme (no arg opens the picker; auto detects the terminal background).",
 		kind:        commandTheme,
+	},
+	{
+		name:        "/notify",
+		usage:       "/notify [list|off|bell|notify|both [unfocused|always|focused]]",
+		group:       commandGroupSession,
+		description: "Pick when Zero alerts you (completion and needs-input). No arg opens the picker.",
+		kind:        commandNotify,
 	},
 	{
 		name:        "/exit",
@@ -415,32 +473,6 @@ func resolveCommand(name string) (commandDefinition, bool) {
 		}
 	}
 	return commandDefinition{}, false
-}
-
-func listCommandNames() []string {
-	names := make([]string, 0, len(commandDefinitions))
-	for _, command := range commandDefinitions {
-		names = append(names, command.name)
-		names = append(names, command.aliases...)
-	}
-	return names
-}
-
-func formatCommandHelpLines() []string {
-	return formatGroupedCommandHelpLines()
-}
-
-func formatGroupedCommandHelpLines() []string {
-	lines := make([]string, 0, len(commandDefinitions)+len(commandGroupOrder()))
-	for _, group := range commandGroupOrder() {
-		groupLines := commandHelpLinesForGroup(group)
-		if len(groupLines) == 0 {
-			continue
-		}
-		lines = append(lines, string(group)+":")
-		lines = append(lines, groupLines...)
-	}
-	return lines
 }
 
 func formatGroupedCommandHelp() string {

@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/fsutil"
+	"github.com/Twigpine/zero/internal/fsutil"
 )
 
-const windowsUnelevatedSetupMarkerSchemaVersion = 1
+const windowsUnelevatedSetupMarkerSchemaVersion = 2
 
 // windowsUnelevatedSetupMarkerMaxPlans bounds the applied-plan history so the
 // marker cannot grow without limit when a user hops between many workspaces.

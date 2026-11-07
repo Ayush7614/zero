@@ -5,8 +5,8 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/sandbox"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/tools"
 	"mvdan.cc/sh/v3/syntax"
 )
 
@@ -496,18 +496,6 @@ func hasStringPrefix(values []string, prefix []string) bool {
 	}
 	for index := range prefix {
 		if values[index] != prefix[index] {
-			return false
-		}
-	}
-	return true
-}
-
-func equalStringSlices(left []string, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
 			return false
 		}
 	}

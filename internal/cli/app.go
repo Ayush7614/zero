@@ -15,33 +15,36 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/agent"
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/hooks"
-	"github.com/Gitlawb/zero/internal/localcontrol"
-	"github.com/Gitlawb/zero/internal/mcp"
-	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/observability"
-	"github.com/Gitlawb/zero/internal/plugins"
-	"github.com/Gitlawb/zero/internal/providerhealth"
-	"github.com/Gitlawb/zero/internal/providermodeldiscovery"
-	"github.com/Gitlawb/zero/internal/provideroauth"
-	"github.com/Gitlawb/zero/internal/provideronboarding"
-	"github.com/Gitlawb/zero/internal/providers"
-	"github.com/Gitlawb/zero/internal/redaction"
-	"github.com/Gitlawb/zero/internal/sandbox"
-	"github.com/Gitlawb/zero/internal/selfverify"
-	"github.com/Gitlawb/zero/internal/sessions"
-	"github.com/Gitlawb/zero/internal/skills"
-	"github.com/Gitlawb/zero/internal/specialist"
-	"github.com/Gitlawb/zero/internal/swarm"
-	"github.com/Gitlawb/zero/internal/tools"
-	"github.com/Gitlawb/zero/internal/tui"
-	"github.com/Gitlawb/zero/internal/update"
-	"github.com/Gitlawb/zero/internal/verify"
-	"github.com/Gitlawb/zero/internal/worktrees"
-	"github.com/Gitlawb/zero/internal/zerogit"
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/agent"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/execution"
+	"github.com/Twigpine/zero/internal/hooks"
+	"github.com/Twigpine/zero/internal/localcontrol"
+	"github.com/Twigpine/zero/internal/mcp"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/observability"
+	"github.com/Twigpine/zero/internal/peermsg"
+	"github.com/Twigpine/zero/internal/plugins"
+	"github.com/Twigpine/zero/internal/providerhealth"
+	"github.com/Twigpine/zero/internal/providermodeldiscovery"
+	"github.com/Twigpine/zero/internal/provideroauth"
+	"github.com/Twigpine/zero/internal/provideronboarding"
+	"github.com/Twigpine/zero/internal/providers"
+	"github.com/Twigpine/zero/internal/redaction"
+	"github.com/Twigpine/zero/internal/sandbox"
+	"github.com/Twigpine/zero/internal/selfverify"
+	"github.com/Twigpine/zero/internal/sessions"
+	"github.com/Twigpine/zero/internal/skills"
+	"github.com/Twigpine/zero/internal/specialist"
+	"github.com/Twigpine/zero/internal/swarm"
+	"github.com/Twigpine/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/tui"
+	"github.com/Twigpine/zero/internal/update"
+	"github.com/Twigpine/zero/internal/verify"
+	"github.com/Twigpine/zero/internal/worktrees"
+	"github.com/Twigpine/zero/internal/zerogit"
+	"github.com/Twigpine/zero/internal/zeroruntime"
+	"github.com/charmbracelet/x/term"
 )
 
 var version = "dev"
@@ -57,37 +60,57 @@ type appDeps struct {
 	// config.SetActiveProviderEnv, set in defaultAppDeps — deliberately NOT filled
 	// by fillAppDeps, so tests never mutate the process environment unless they
 	// inject it). nil ⇒ no export.
-	exportActiveProvider   func(providerName string)
-	probeProviderHealth    func(context.Context, providerhealth.Options) providerhealth.Result
-	discoverProviderModels func(context.Context, config.ProviderProfile) ([]providermodeldiscovery.Model, error)
-	detectLocalRuntimes    func(context.Context, provideronboarding.LocalDetectOptions) []provideronboarding.DetectedLocalRuntime
-	openRouterLogin        func(context.Context, provideroauth.OpenRouterOptions) (string, error)
-	newSessionStore        func() *sessions.Store
-	loadPlugins            func(plugins.LoadOptions) (plugins.LoadResult, error)
-	loadHooks              func(hooks.LoadOptions) (hooks.LoadResult, error)
-	skillsDir              func() string
-	pluginsDir             func() string
-	toolsDir               func() string
-	newMCPStore            func() (*mcp.PermissionStore, error)
-	newMCPTokenStore       func() (*mcp.TokenStore, error)
-	newSandboxStore        func() (*sandbox.GrantStore, error)
-	selectSandboxBackend   func(sandbox.BackendOptions) sandbox.Backend
-	runSandboxSetupHelper  func(path string, args []string, stdout io.Writer, stderr io.Writer) error
-	registerMCPTools       func(context.Context, *tools.Registry, config.MCPConfig, mcp.RegisterOptions) (mcpToolRuntime, error)
-	prepareWorktree        func(context.Context, worktrees.Options) (worktrees.Result, error)
-	detectVerifyPlan       func(string) (verify.Plan, error)
-	runVerify              func(context.Context, verify.Plan, verify.RunOptions) verify.Report
-	runSelfVerify          func(context.Context, verify.Plan, selfverify.Options) selfverify.Report
-	runAgentEval           func(context.Context, agentEvalOptions) (agentEvalReport, error)
-	inspectChanges         func(context.Context, zerogit.InspectOptions) (zerogit.ChangeSummary, error)
-	commitChanges          func(context.Context, zerogit.CommitOptions) (zerogit.CommitResult, error)
-	pushChanges            func(context.Context, zerogit.PushOptions) (zerogit.PushResult, error)
-	createPR               func(context.Context, zerogit.PROptions) (zerogit.PRResult, error)
-	runTUI                 func(context.Context, tui.Options) int
-	runEditor              func(string) error
-	checkUpdate            func(context.Context, update.Options) (update.Result, error)
-	applyUpdate            func(context.Context, update.Options) (update.ApplyResult, error)
-	now                    func() time.Time
+	exportActiveProvider func(providerName string)
+	// getenv reads a process environment variable (production: os.Getenv, set in
+	// defaultAppDeps — deliberately NOT filled by fillAppDeps, so tests are hermetic
+	// against ambient vars like ZERO_PROVIDER unless they inject it). nil ⇒ empty.
+	getenv                       func(string) string
+	probeProviderHealth          func(context.Context, providerhealth.Options) providerhealth.Result
+	discoverProviderModels       func(context.Context, config.ProviderProfile) ([]providermodeldiscovery.Model, error)
+	detectLocalRuntimes          func(context.Context, provideronboarding.LocalDetectOptions) []provideronboarding.DetectedLocalRuntime
+	openRouterLogin              func(context.Context, provideroauth.OpenRouterOptions) (string, error)
+	newSessionStore              func() *sessions.Store
+	loadPlugins                  func(plugins.LoadOptions) (plugins.LoadResult, error)
+	loadHooks                    func(hooks.LoadOptions) (hooks.LoadResult, error)
+	skillsDir                    func() string
+	pluginsDir                   func() string
+	toolsDir                     func() string
+	newMCPStore                  func() (*mcp.PermissionStore, error)
+	newMCPTokenStore             func() (*mcp.TokenStore, error)
+	newSandboxStore              func() (*sandbox.GrantStore, error)
+	selectSandboxBackend         func(sandbox.BackendOptions) sandbox.Backend
+	runSandboxSetupHelper        func(path string, args []string, stdout io.Writer, stderr io.Writer) error
+	registerMCPTools             func(context.Context, *tools.Registry, config.MCPConfig, mcp.RegisterOptions) (mcpToolRuntime, error)
+	prepareWorktree              func(context.Context, worktrees.Options) (worktrees.Result, error)
+	releaseWorktree              func(context.Context, worktrees.Options, string) error
+	detectVerifyPlan             func(string) (verify.Plan, error)
+	runVerify                    func(context.Context, verify.Plan, verify.RunOptions) verify.Report
+	runSelfVerify                func(context.Context, verify.Plan, selfverify.Options) selfverify.Report
+	runAgentEval                 func(context.Context, agentEvalOptions) (agentEvalReport, error)
+	inspectChanges               func(context.Context, zerogit.InspectOptions) (zerogit.ChangeSummary, error)
+	commitChanges                func(context.Context, zerogit.CommitOptions) (zerogit.CommitResult, error)
+	pushChanges                  func(context.Context, zerogit.PushOptions) (zerogit.PushResult, error)
+	createPR                     func(context.Context, zerogit.PROptions) (zerogit.PRResult, error)
+	createBranch                 func(context.Context, zerogit.BranchOptions) (zerogit.BranchResult, error)
+	isDefaultBranch              func(context.Context, zerogit.DefaultBranchOptions) (bool, string, string, error)
+	currentGitUser               func(context.Context, string) string
+	headCommitSubject            func(context.Context, string) string
+	commitsAhead                 func(context.Context, string, string, string) (int, error)
+	isUnbornRemote               func(context.Context, string, string) (bool, error)
+	refreshTrackingRef           func(context.Context, string, string, string) error
+	branchUpstreamRemote         func(context.Context, string, string) string
+	branchUpstreamRemoteAndMerge func(context.Context, string, string) (string, string)
+	resolveRemoteBranchTip       func(context.Context, string, string, string) (string, error)
+	remoteHasBranch              func(context.Context, string, string, string) (bool, error)
+	currentGitBranch             func(context.Context, string) string
+	currentBranchTip             func(context.Context, string) string
+	deleteBranch                 func(context.Context, string, string, string) error
+	resetBranchRef               func(context.Context, string, string, string, string) error
+	runTUI                       func(context.Context, tui.Options) int
+	runEditor                    func(string) error
+	checkUpdate                  func(context.Context, update.Options) (update.Result, error)
+	applyUpdate                  func(context.Context, update.Options) (update.ApplyResult, error)
+	now                          func() time.Time
 }
 
 type mcpToolRuntime interface {
@@ -117,6 +140,7 @@ func defaultAppDeps() appDeps {
 		stdin:                os.Stdin,
 		userConfigPath:       config.DefaultUserConfigPath,
 		exportActiveProvider: config.SetActiveProviderEnv,
+		getenv:               os.Getenv,
 		resolveConfig: func(workspaceRoot string, overrides config.Overrides) (config.ResolvedConfig, error) {
 			options, err := config.DefaultResolveOptions(workspaceRoot)
 			if err != nil {
@@ -180,6 +204,7 @@ func defaultAppDeps() appDeps {
 			return mcp.RegisterTools(ctx, registry, cfg, options)
 		},
 		prepareWorktree:  worktrees.Prepare,
+		releaseWorktree:  worktrees.Release,
 		detectVerifyPlan: verify.DetectPlan,
 		runVerify:        verify.Run,
 		runSelfVerify:    selfverify.Run,
@@ -188,11 +213,52 @@ func defaultAppDeps() appDeps {
 		commitChanges:    zerogit.Commit,
 		pushChanges:      zerogit.Push,
 		createPR:         zerogit.CreatePR,
-		runTUI:           tui.Run,
-		runEditor:        openEditor,
-		checkUpdate:      update.Check,
-		applyUpdate:      update.Apply,
-		now:              time.Now,
+		createBranch:     zerogit.CreateBranch,
+		isDefaultBranch:  zerogit.IsDefaultBranch,
+		currentGitUser: func(ctx context.Context, cwd string) string {
+			return zerogit.CurrentGitUser(ctx, cwd, nil)
+		},
+		headCommitSubject: func(ctx context.Context, cwd string) string {
+			return zerogit.HeadCommitSubject(ctx, cwd, nil)
+		},
+		commitsAhead: func(ctx context.Context, cwd, remote, branch string) (int, error) {
+			return zerogit.CommitsAhead(ctx, cwd, remote, branch, nil)
+		},
+		isUnbornRemote: func(ctx context.Context, cwd, remote string) (bool, error) {
+			return zerogit.IsUnbornRemote(ctx, cwd, remote, nil)
+		},
+		refreshTrackingRef: func(ctx context.Context, cwd, remote, branch string) error {
+			return zerogit.RefreshTrackingRef(ctx, cwd, remote, branch, nil)
+		},
+		branchUpstreamRemote: func(ctx context.Context, cwd, branch string) string {
+			return zerogit.UpstreamRemote(ctx, cwd, branch, nil)
+		},
+		branchUpstreamRemoteAndMerge: func(ctx context.Context, cwd, branch string) (string, string) {
+			return zerogit.UpstreamRemoteAndMergeBranch(ctx, cwd, branch, nil)
+		},
+		resolveRemoteBranchTip: func(ctx context.Context, cwd, remote, branch string) (string, error) {
+			return zerogit.ResolveRemoteBranchTip(ctx, cwd, remote, branch, nil)
+		},
+		remoteHasBranch: func(ctx context.Context, cwd, remote, branch string) (bool, error) {
+			return zerogit.RemoteHasBranch(ctx, cwd, remote, branch, nil)
+		},
+		currentGitBranch: func(ctx context.Context, cwd string) string {
+			return zerogit.CurrentBranch(ctx, cwd, nil)
+		},
+		currentBranchTip: func(ctx context.Context, cwd string) string {
+			return zerogit.CurrentBranchTip(ctx, cwd, nil)
+		},
+		deleteBranch: func(ctx context.Context, cwd, fallbackBranch, branchToDelete string) error {
+			return zerogit.DeleteBranch(ctx, cwd, fallbackBranch, branchToDelete, nil)
+		},
+		resetBranchRef: func(ctx context.Context, cwd, branch, newTip, expectedOld string) error {
+			return zerogit.ResetBranchRef(ctx, cwd, branch, newTip, nil, expectedOld)
+		},
+		runTUI:      tui.Run,
+		runEditor:   openEditor,
+		checkUpdate: update.Check,
+		applyUpdate: update.Apply,
+		now:         time.Now,
 	}
 }
 
@@ -245,40 +311,35 @@ func runWithDeps(args []string, stdout io.Writer, stderr io.Writer, deps appDeps
 	// cache file on the machine. The refresh itself is fired in exec/TUI startup.
 	modelregistry.EnableModelsDevOverlay()
 
-	addDirs, args, err := splitLeadingAddDirFlags(args)
+	// --add-dir, --theme and --allow-escalation may be written in any order;
+	// see splitLeadingRootFlags for why they are split together.
+	root, args, err := splitLeadingRootFlags(args)
 	if err != nil {
 		return writeAppError(stderr, err.Error(), 1)
 	}
-	// --theme <name> selects the TUI palette non-interactively (auto or any registered
-	// theme; populates tui.Options.Theme, which resolveThemeMode prefers over
-	// ZERO_THEME). Re-split --add-dir afterward so it may appear on either side of --theme.
-	theme, args, err := splitLeadingThemeFlag(args)
-	if err != nil {
-		return writeAppError(stderr, err.Error(), 1)
-	}
-	moreDirs, args, err := splitLeadingAddDirFlags(args)
-	if err != nil {
-		return writeAppError(stderr, err.Error(), 1)
-	}
-	addDirs = append(addDirs, moreDirs...)
+	addDirs, theme, allowEscalation := root.addDirs, root.theme, root.allowEscalation
 
 	if len(args) == 0 {
-		return runInteractiveTUI(stderr, deps, agent.PermissionModeAsk, addDirs, theme)
+		return runInteractiveTUI(stderr, deps, agent.PermissionModeAsk, addDirs, theme, allowEscalation)
 	}
 
-	// --add-dir grants an extra write root, and only the interactive TUI and
-	// exec dispatch paths consume one. Fail loud everywhere else rather than
-	// silently discarding an explicit grant — including help/version, which
-	// run no agent and could only ignore it. The allowlist names exactly the
-	// cases below that forward addDirs; a future subcommand is rejected by
-	// default until it opts in here.
-	if len(addDirs) > 0 {
-		switch args[0] {
-		case "--skip-permissions-unsafe", "-p", "--prompt", "exec":
-			// Forwarded by the matching case below.
-		default:
-			return writeAppError(stderr, "--add-dir is only supported for the interactive TUI and exec", 1)
-		}
+	// --add-dir grants an extra write root and --allow-escalation opts a run
+	// into mid-run model escalation; only the interactive TUI and exec consume
+	// either. Both are forwarded to exec below and rejected loudly everywhere
+	// else rather than silently discarded, including help/version, which run
+	// no agent and could only ignore them. The allowlist names exactly the
+	// cases below that forward; a future subcommand is rejected by default
+	// until it opts in here.
+	forwardsRootFlags := false
+	switch args[0] {
+	case "--skip-permissions-unsafe", "-p", "--prompt", "exec":
+		forwardsRootFlags = true
+	}
+	if len(addDirs) > 0 && !forwardsRootFlags {
+		return writeAppError(stderr, "--add-dir is only supported for the interactive TUI and exec", 1)
+	}
+	if allowEscalation && !forwardsRootFlags {
+		return writeAppError(stderr, "--allow-escalation is only supported for the interactive TUI and exec", 1)
 	}
 
 	switch args[0] {
@@ -288,26 +349,24 @@ func runWithDeps(args []string, stdout io.Writer, stderr io.Writer, deps appDeps
 		// reach unsafe mode in the shell — and the "!" shell escape (which is
 		// gated behind unsafe) was therefore unreachable.
 		//
-		// --add-dir may legally appear on either side of the flag, so re-split
-		// the remaining args and merge with the dirs already collected. Any
-		// trailing non-flag args were ignored on this path before --add-dir
-		// existed and still are — but an --add-dir hidden BEHIND one would be
-		// silently dropped with them, so reject that misplacement loudly.
-		moreDirs, rest, err := splitLeadingAddDirFlags(args[1:])
+		// The root flags may legally appear on either side of this flag, so
+		// split them again from what follows it and merge with what the root
+		// already took. Any trailing non-flag args were ignored on this path
+		// before --add-dir existed and still are, but an --add-dir hidden
+		// BEHIND one would be silently dropped with them, so reject that
+		// misplacement loudly below.
+		more, rest, err := splitLeadingRootFlags(args[1:])
 		if err != nil {
 			return writeAppError(stderr, err.Error(), 1)
 		}
-		// --theme may appear here too; extract it before the stray-arg checks so it is
-		// not rejected as an unexpected positional, then re-split --add-dir after it.
-		skipTheme, rest, err := splitLeadingThemeFlag(rest)
-		if err != nil {
-			return writeAppError(stderr, err.Error(), 1)
+		moreDirs := more.addDirs
+		// A --theme written before the flag was taken at the root and used to be
+		// dropped here; one written after it wins, as the last occurrence does.
+		skipTheme := theme
+		if more.theme != "" {
+			skipTheme = more.theme
 		}
-		evenMoreDirs, rest, err := splitLeadingAddDirFlags(rest)
-		if err != nil {
-			return writeAppError(stderr, err.Error(), 1)
-		}
-		moreDirs = append(moreDirs, evenMoreDirs...)
+		skipAllowEscalation := more.allowEscalation
 		// A misplaced --add-dir anywhere in the remainder is the more specific error,
 		// so check for it across all of rest before rejecting stray args.
 		for _, arg := range rest {
@@ -324,7 +383,7 @@ func runWithDeps(args []string, stdout io.Writer, stderr io.Writer, deps appDeps
 				return writeAppError(stderr, "--skip-permissions-unsafe launches the interactive TUI and takes no prompt or subcommand; for a one-shot unsafe run use `zero exec --skip-permissions-unsafe -p \"...\"`", 1)
 			}
 		}
-		return runInteractiveTUI(stderr, deps, agent.PermissionModeUnsafe, append(append([]string{}, addDirs...), moreDirs...), skipTheme)
+		return runInteractiveTUI(stderr, deps, agent.PermissionModeUnsafe, append(append([]string{}, addDirs...), moreDirs...), skipTheme, allowEscalation || skipAllowEscalation)
 	case "-h", "--help", "help":
 		if err := writeHelp(stdout); err != nil {
 			return 1
@@ -339,7 +398,17 @@ func runWithDeps(args []string, stdout io.Writer, stderr io.Writer, deps appDeps
 				return 0
 			}
 		}
-		if _, err := fmt.Fprintf(stdout, "zero %s\n", version); err != nil {
+		// Pipes and redirects keep the machine-readable contract exactly as it
+		// was: a single "zero <version>" line. Scripts, command substitutions,
+		// and the NPM wrapper smoke check all parse that record, so the banner
+		// is strictly a TTY affordance.
+		if !stdoutIsTerminal(stdout) {
+			if _, err := fmt.Fprintf(stdout, "zero %s\n", version); err != nil {
+				return 1
+			}
+			return 0
+		}
+		if _, err := fmt.Fprintf(stdout, "%s\n\nzero %s\n", tui.Wordmark(), version); err != nil {
 			return 1
 		}
 		return 0
@@ -347,16 +416,18 @@ func runWithDeps(args []string, stdout io.Writer, stderr io.Writer, deps appDeps
 		if len(args) < 2 {
 			return writePromptRequired(stderr)
 		}
-		// Forward leading --add-dir occurrences so exec's own parser collects them.
+		// Forward the root flags exec consumes so its own parser collects them.
 		// Use the inline --prompt=<value> form so a prompt whose first character is a
 		// dash (e.g. `zero -p "-foo"`) is taken verbatim instead of being mistaken for
 		// a flag and rejected with "--prompt requires a value" (matches the cron path).
-		execArgs := append(addDirFlagArgs(addDirs), "--prompt="+args[1])
+		execArgs := append(rootFlagArgs(addDirs, allowEscalation), "--prompt="+args[1])
 		execArgs = append(execArgs, args[2:]...)
 		return runExec(execArgs, stdout, stderr, deps)
 	case "exec":
-		// Forward leading --add-dir occurrences so exec's own parser collects them.
-		return runExec(append(addDirFlagArgs(addDirs), args[1:]...), stdout, stderr, deps)
+		// Forward the root flags exec consumes so its own parser collects them.
+		return runExec(append(rootFlagArgs(addDirs, allowEscalation), args[1:]...), stdout, stderr, deps)
+	case "completions":
+		return runCompletions(args[1:], stdout, stderr)
 	case "daemon":
 		return runDaemon(args[1:], stdout, stderr, deps)
 	case "config":
@@ -513,6 +584,9 @@ func fillAppDeps(deps appDeps) appDeps {
 	if deps.prepareWorktree == nil {
 		deps.prepareWorktree = defaults.prepareWorktree
 	}
+	if deps.releaseWorktree == nil {
+		deps.releaseWorktree = defaults.releaseWorktree
+	}
 	if deps.detectVerifyPlan == nil {
 		deps.detectVerifyPlan = defaults.detectVerifyPlan
 	}
@@ -537,6 +611,45 @@ func fillAppDeps(deps appDeps) appDeps {
 	if deps.createPR == nil {
 		deps.createPR = defaults.createPR
 	}
+	if deps.createBranch == nil {
+		deps.createBranch = defaults.createBranch
+	}
+	if deps.isDefaultBranch == nil {
+		deps.isDefaultBranch = defaults.isDefaultBranch
+	}
+	if deps.currentGitUser == nil {
+		deps.currentGitUser = defaults.currentGitUser
+	}
+	if deps.headCommitSubject == nil {
+		deps.headCommitSubject = defaults.headCommitSubject
+	}
+	if deps.commitsAhead == nil {
+		deps.commitsAhead = defaults.commitsAhead
+	}
+	if deps.isUnbornRemote == nil {
+		deps.isUnbornRemote = defaults.isUnbornRemote
+	}
+	if deps.refreshTrackingRef == nil {
+		deps.refreshTrackingRef = defaults.refreshTrackingRef
+	}
+	if deps.branchUpstreamRemote == nil {
+		deps.branchUpstreamRemote = defaults.branchUpstreamRemote
+	}
+	if deps.branchUpstreamRemoteAndMerge == nil {
+		deps.branchUpstreamRemoteAndMerge = defaults.branchUpstreamRemoteAndMerge
+	}
+	if deps.remoteHasBranch == nil {
+		deps.remoteHasBranch = defaults.remoteHasBranch
+	}
+	if deps.currentGitBranch == nil {
+		deps.currentGitBranch = defaults.currentGitBranch
+	}
+	if deps.currentBranchTip == nil {
+		deps.currentBranchTip = defaults.currentBranchTip
+	}
+	// resolveRemoteBranchTip, deleteBranch, and resetBranchRef stay nil when
+	// unset so unit tests that mock createBranch without a real git tree do not
+	// hit real git restore/delete commands.
 	if deps.runTUI == nil {
 		deps.runTUI = defaults.runTUI
 	}
@@ -566,20 +679,23 @@ func fillAppDeps(deps appDeps) appDeps {
 	baseProbeProviderHealth := deps.probeProviderHealth
 	deps.probeProviderHealth = func(ctx context.Context, options providerhealth.Options) providerhealth.Result {
 		options.Profile = applyStoredProviderKeyAt(options.Profile, userConfigPath)
+		if options.OAuthResolver == nil {
+			options.OAuthResolver, _ = oauthLoginForProfile(options.Profile)
+		}
 		return baseProbeProviderHealth(ctx, options)
 	}
 	return deps
 }
 
-func runInteractiveTUI(stderr io.Writer, deps appDeps, permissionMode agent.PermissionMode, addDirs []string, theme string) int {
-	return runInteractiveTUIWithSetup(stderr, deps, permissionMode, addDirs, theme, false)
+func runInteractiveTUI(stderr io.Writer, deps appDeps, permissionMode agent.PermissionMode, addDirs []string, theme string, allowEscalation bool) int {
+	return runInteractiveTUIWithSetup(stderr, deps, permissionMode, addDirs, theme, false, allowEscalation)
 }
 
-func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode agent.PermissionMode, addDirs []string, theme string, forceSetup bool) int {
+func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode agent.PermissionMode, addDirs []string, theme string, forceSetup bool, allowEscalation bool) int {
 	// Refresh the models.dev pricing/limits cache in the background when stale;
 	// the overlay is read at registry construction from the cache file, so this
 	// benefits the next run and never blocks or fails this one.
-	go func() { _ = modelregistry.RefreshModelsDevCache(context.Background()) }()
+	modelregistry.StartModelsDevRefresh()
 
 	workspaceRoot, err := deps.getwd()
 	if err != nil {
@@ -611,7 +727,13 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 			resolved.Provider = usable
 			resolved.ActiveProvider = usable.Name
 		} else {
-			resolved = config.ResolvedConfig{}
+			// Fresh-onboarding reset, but the user's notification preference is
+			// NOT config-to-redo: clearing it here would surface as an empty
+			// Options.Notify, and the TUI's unconfigured default (both/unfocused)
+			// would then resurrect alerts a user explicitly turned off while the
+			// setup wizard runs (maintainer review, PR #1001). Carry the stored
+			// block through; other wizard-visible state starts clean as before.
+			resolved = config.ResolvedConfig{Notify: resolved.Notify}
 			forceSetup = true
 		}
 	}
@@ -667,6 +789,34 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 
 	registry := newCoreRegistryScoped(workspaceRoot, scope)
 	registerLocalControlTools(registry, workspaceRoot, resolved.LocalControl)
+	// Mid-run model escalation is opt-in on this surface too. The tool is present
+	// only when the operator asked for it with --allow-escalation, and the
+	// switchers that make it do anything ride on the same flag through
+	// Options.AllowEscalation below. Registering one without the other ships a
+	// tool the loop will never act on, which looks like a feature and is not.
+	if allowEscalation {
+		registry.Register(tools.NewEscalateModelTool())
+	}
+	executionRunner := execution.NewRunner(nil)
+	sandboxStore, err := deps.newSandboxStore()
+	if err != nil {
+		return writeAppError(stderr, "failed to initialize sandbox grants: "+err.Error(), 1)
+	}
+	if notice, err := sandboxStore.ConsumeMigrationNotice(); err != nil {
+		return writeAppError(stderr, "failed to migrate sandbox grants: "+err.Error(), 1)
+	} else if notice != "" {
+		_, _ = fmt.Fprintln(stderr, "[zero] "+notice)
+	}
+	sandboxBackend := deps.selectSandboxBackend(sandbox.BackendOptions{})
+	sandboxEngine := sandbox.NewEngine(sandbox.EngineOptions{
+		WorkspaceRoot:    workspaceRoot,
+		Policy:           applyConfiguredSandboxPolicy(sandbox.DefaultPolicy(), resolved.Sandbox),
+		Store:            sandboxStore,
+		Backend:          sandboxBackend,
+		Scope:            scope,
+		SensitiveEnvKeys: providerSensitiveEnvKeys(resolved),
+	})
+	executionRunner.SetPreparer(sandboxEngine)
 	specialistRuntime, err := registerSpecialistTools(registry, workspaceRoot, resolved.Swarm.MaxTeamSize)
 	if err != nil {
 		return writeAppError(stderr, "failed to initialize specialist tools: "+err.Error(), 1)
@@ -696,22 +846,26 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 		mcpTokenStore = nil
 		err = nil
 	}
+	criticalMCPConfig, optionalMCPConfig := splitMCPStartupConfig(mcpConfig)
 	mcpRuntime := mcpToolRuntime(noopMCPRuntime{})
-	if len(mcpConfig.Servers) > 0 {
-		mcpRuntime, err = deps.registerMCPTools(context.Background(), registry, mcpConfig, mcp.RegisterOptions{
+	if len(criticalMCPConfig.Servers) > 0 {
+		runtime, registerErr := deps.registerMCPTools(context.Background(), registry, criticalMCPConfig, mcp.RegisterOptions{
 			PermissionStore: mcpPermissionStore,
 			Autonomy:        mcp.AutonomyLow,
+			Execution:       executionRunner,
+			WorkspaceRoot:   workspaceRoot,
 		})
-	}
-	if err != nil {
-		closeMCPRuntime(stderr, mcpRuntime)
-		return writeAppError(stderr, err.Error(), 1)
+		if registerErr != nil {
+			closeMCPRuntime(stderr, runtime)
+			return writeAppError(stderr, redaction.ErrorMessage(registerErr, redaction.Options{}), 1)
+		}
+		mcpRuntime = runtime
 	}
 	defer closeMCPRuntime(stderr, mcpRuntime)
 	// A server that could not be reached or validated is skipped, not fatal (one
 	// bad MCP server must not abort startup) — surface each so a missing tool set is
 	// explained rather than silently absent. A built-in default the user never
-	// configured (e.g. keyless Firecrawl with no credentials) is the exception: it
+	// configured (e.g. keyless Exa with no credentials) is the exception: it
 	// was never asked for, so its failure is not worth a startup warning — only
 	// servers the user actually configured warn on failure (issue #552).
 	for _, skipped := range mcpRuntime.Skipped() {
@@ -727,7 +881,7 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 	// The interactive TUI is not worktree-reassigned, so the trust root is the
 	// launch directory itself.
 	trustRoot := workspaceRoot
-	pluginActivation := activatePlugins(workspaceRoot, registry, deps, stderr, trustRoot)
+	pluginActivation := activatePlugins(workspaceRoot, registry, deps, stderr, trustRoot, executionRunner)
 	// Ask (not Auto) is the interactive default: in Auto, ToolAdvertised exposes
 	// only PermissionAllow tools, so prompt-gated tools (write_file/edit_file/bash/
 	// apply_patch) would never be offered to the model — the TUI could neither edit
@@ -742,25 +896,57 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 	if permissionMode == "" {
 		permissionMode = agent.PermissionModeAsk
 	}
+	sessionStore := deps.newSessionStore()
+	peerClass := peermsg.PermissionPrompting
+	if permissionMode == agent.PermissionModeUnsafe {
+		peerClass = peermsg.PermissionBypass
+	}
+	peerService, peerErr := peermsg.New(peermsg.Options{
+		Identity: peermsg.Identity{
+			Cwd:             workspaceRoot,
+			PermissionClass: peerClass,
+		},
+		InboundPolicy: peermsg.InboundPolicy(resolved.CrossSessionInbound),
+	})
+	if peerErr != nil {
+		fmt.Fprintf(stderr, "warning: cross-session messaging unavailable: %s\n", peerErr)
+		peerService = nil
+	} else {
+		for _, tool := range tools.NewPeerSessionTools(peerService) {
+			registry.Register(tool)
+		}
+	}
 	// Activate deferred MCP-tool loading for the interactive run only when the
 	// VISIBLE deferred-eligible count meets the resolved threshold, matching exec.
-	// The registry is complete (core + specialist + MCP + plugins) here, so the
-	// count is accurate; below threshold this is a no-op and the surface is
-	// unchanged. The interactive surface applies no operator tool filters, so
-	// enabled/disabled are nil — matching the AgentOptions below.
+	// This first pass covers every prompt-critical tool. Optional built-in MCP
+	// defaults re-run the same gate after publishing their atomic batch, so a
+	// later catalog generation cannot miss its loader. The interactive surface
+	// applies no operator tool filters, so enabled/disabled are nil — matching the
+	// AgentOptions below.
 	registerToolSearchIfEligible(registry, resolved.Tools.DeferThreshold, permissionMode, nil, nil)
-	sandboxStore, err := deps.newSandboxStore()
-	if err != nil {
-		return writeAppError(stderr, "failed to initialize sandbox grants: "+err.Error(), 1)
+	var optionalMCPRuntime *optionalMCPStartup
+	var awaitToolReadiness func(context.Context)
+	if len(optionalMCPConfig.Servers) > 0 {
+		optionalMCPRuntime = startOptionalMCP(
+			context.Background(),
+			registry,
+			optionalMCPConfig,
+			mcp.RegisterOptions{
+				PermissionStore: mcpPermissionStore,
+				Autonomy:        mcp.AutonomyLow,
+				Execution:       executionRunner,
+				WorkspaceRoot:   workspaceRoot,
+			},
+			deps.registerMCPTools,
+			func() {
+				registerToolSearchIfEligible(registry, resolved.Tools.DeferThreshold, permissionMode, nil, nil)
+			},
+		)
+		defer closeMCPRuntime(stderr, optionalMCPRuntime)
+		awaitToolReadiness = func(ctx context.Context) {
+			optionalMCPRuntime.Await(ctx, optionalMCPPromptGrace)
+		}
 	}
-	sandboxBackend := deps.selectSandboxBackend(sandbox.BackendOptions{})
-	sandboxEngine := sandbox.NewEngine(sandbox.EngineOptions{
-		WorkspaceRoot: workspaceRoot,
-		Policy:        applyConfiguredSandboxPolicy(sandbox.DefaultPolicy(), resolved.Sandbox),
-		Store:         sandboxStore,
-		Backend:       sandboxBackend,
-		Scope:         scope,
-	})
 	lastKnownMCPConfig := mcpConfig
 	fileTracker := tools.NewFileTracker()
 	var scratchBaseline scratchFileBaseline
@@ -777,13 +963,19 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 	// Build the hooks dispatcher out of the AgentOptions literal so its trust skip
 	// report can be combined with the plugin activation's, and emit at most one
 	// notice when project hooks/plugins were dropped for an untrusted workspace.
-	hookDispatcher, hookSkip := newHookDispatcherWithExtra(workspaceRoot, pluginActivation.hooks, trustRoot)
+	hookDispatcher, hookSkip := newHookDispatcherWithExtra(workspaceRoot, pluginActivation.hooks, trustRoot, executionRunner)
 	emitTrustNotice(stderr, hookSkip, pluginActivation.trustSkip, mcpSkip)
+	// From the engine the session's commands run through, so the notice
+	// describes the sandbox they actually get.
+	startupNotices := []string{sandboxEngine.DegradedNotice()}
+	modelRPM := zeroruntime.NewModelRPMLimiter(resolved.ModelRPM)
 	return deps.runTUI(context.Background(), tui.Options{
+		ModelRPM:             modelRPM,
 		Cwd:                  workspaceRoot,
 		Version:              version,
 		Theme:                theme,
 		SavedTheme:           resolved.Preferences.Theme,
+		SavedPet:             resolved.Preferences.Pet,
 		UserConfigPath:       userConfigPath,
 		DoctorUserConfigPath: doctorUserConfigPath,
 		ProjectConfigPath:    projectConfigPath,
@@ -794,10 +986,20 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 		FavoriteModels:       resolved.Preferences.FavoriteModels,
 		RecentModels:         resolved.Preferences.RecentModels,
 		RecapsEnabled:        resolved.Preferences.RecapsEnabled(),
+		CompactionModel:      resolved.Preferences.CompactionModel,
 		Provider:             provider,
 		NewProvider:          deps.newProvider,
-		ProbeProviderHealth:  deps.probeProviderHealth,
-		UserAgent:            userAgent(),
+		NewTurnSessionProvider: func(profile config.ProviderProfile, provider zeroruntime.Provider) zeroruntime.TurnSessionProvider {
+			if provider == nil {
+				return nil
+			}
+			if optimized, ok := providers.ConfiguredTurnSessions(profile, provider, providers.Options{ModelRPM: modelRPM}); ok {
+				return optimized
+			}
+			return providers.DefaultTurnSessions(profile, provider, providers.Options{})
+		},
+		ProbeProviderHealth: deps.probeProviderHealth,
+		UserAgent:           userAgent(),
 		PrepareRunCompletionWarning: func() {
 			scratchBaseline = scratchFileSnapshot(workspaceRoot)
 		},
@@ -805,7 +1007,9 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 			return scratchFileWarning(workspaceRoot, scratchBaseline)
 		},
 		Registry:           registry,
-		SessionStore:       deps.newSessionStore(),
+		AwaitToolReadiness: awaitToolReadiness,
+		SessionStore:       sessionStore,
+		PeerService:        peerService,
 		SandboxStore:       sandboxStore,
 		MCPConfig:          mcpConfig,
 		MCPPermissionStore: mcpPermissionStore,
@@ -841,6 +1045,7 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 			Specialists:    specialistRuntime.specialists,
 			Skills:         pluginActivation.skillInfos(deps.skillsDir()),
 		},
+		AllowEscalation: allowEscalation,
 		// LoadSkills backs /skills and direct /<skill-name> invocation in the TUI.
 		// It resolves against the same merged set (default dir + plugin skill
 		// roots) as the skill tool and the system-prompt list, re-read per use so
@@ -852,6 +1057,7 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 		PermissionMode:            permissionMode,
 		Notify:                    resolved.Notify,
 		KeyBindings:               resolved.KeyBindings,
+		StartupNotices:            startupNotices,
 		STT:                       resolved.STT,
 		BuildDictationTranscriber: newDictationTranscriberFactory(resolved, userConfigPath, sttServerManager),
 		ShutdownDictationServer:   sttServerManager.Shutdown,
@@ -1115,6 +1321,17 @@ func closeSpecialistRuntime(stderr io.Writer, runtime *agentToolRuntime) {
 	}
 }
 
+// stdoutIsTerminal reports whether w is an interactive terminal. Tests pass
+// bytes.Buffer writers and pipes/redirects fail term.IsTerminal, so both take
+// the machine-readable path.
+func stdoutIsTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	return term.IsTerminal(f.Fd())
+}
+
 func writeAppError(stderr io.Writer, message string, exitCode int) int {
 	if _, err := fmt.Fprintf(stderr, "[zero] %s\n", message); err != nil {
 		return 1
@@ -1134,6 +1351,7 @@ Usage:
 
 Commands:
   exec       Run a one-shot prompt through the Go agent runtime
+  completions Generate shell completion scripts
   daemon     Manage the local background worker daemon (start/stop/status/run/attach)
   setup      Guide first-run provider setup
   config     Inspect resolved Go configuration without leaking secrets
@@ -1155,7 +1373,8 @@ Commands:
   mcp        Manage MCP backend settings
   auth       Log in to model providers via OAuth
   sandbox    Inspect sandbox policy and persistent grants
-  update     Check for Zero CLI updates
+  update     Check or apply Zero CLI updates (requires --check or --apply)
+  upgrade    Download, verify, and install available Zero CLI updates
   worktrees  Prepare isolated git worktrees
   verify     Detect and run local verification checks
   eval       Validate offline agent eval suites
@@ -1173,6 +1392,7 @@ Flags:
   -v, --version                  Print version
   -p, --prompt                   Run a one-shot prompt
       --add-dir <path>           Allow writes in an extra directory (repeatable)
+      --allow-escalation         Let the agent escalate to a stronger model mid-run via escalate_model
       --skip-permissions-unsafe  Launch the interactive shell in unsafe mode (enables the ! shell escape)
 `)
 	return err
@@ -1185,6 +1405,17 @@ func addDirFlagArgs(addDirs []string) []string {
 	flags := make([]string, 0, 2*len(addDirs))
 	for _, dir := range addDirs {
 		flags = append(flags, "--add-dir", dir)
+	}
+	return flags
+}
+
+// rootFlagArgs re-synthesises the root flags exec consumes, in the spelling
+// its own parser accepts, so a flag written before the subcommand reaches
+// the run exactly as one written after it would.
+func rootFlagArgs(addDirs []string, allowEscalation bool) []string {
+	flags := addDirFlagArgs(addDirs)
+	if allowEscalation {
+		flags = append(flags, "--allow-escalation")
 	}
 	return flags
 }
@@ -1227,6 +1458,83 @@ func splitLeadingAddDirFlags(args []string) ([]string, []string, error) {
 		}
 	}
 	return addDirs, args, nil
+}
+
+// rootFlags is what the leading root flags amount to once every one of them
+// has been stripped from the front of the argument list.
+type rootFlags struct {
+	addDirs         []string
+	theme           string
+	allowEscalation bool
+}
+
+// splitLeadingRootFlags strips --add-dir, --theme and --allow-escalation from
+// the front of args in whatever order they were written, stopping at the
+// first token none of them claims.
+//
+// EACH SPLITTER STOPS AT THE FIRST TOKEN IT DOES NOT OWN, so running them once
+// in a fixed sequence made the order the operator wrote them in load-bearing:
+// a flag handled late in the sequence stranded every flag written after it as
+// an unknown command, and `zero --allow-escalation --theme auto` exited with
+// an argument error instead of launching. Running the sequence until it makes
+// no progress accepts every ordering, including a flag repeated on both sides
+// of another.
+func splitLeadingRootFlags(args []string) (rootFlags, []string, error) {
+	var flags rootFlags
+	for {
+		before := len(args)
+		addDirs, rest, err := splitLeadingAddDirFlags(args)
+		if err != nil {
+			return rootFlags{}, nil, err
+		}
+		flags.addDirs = append(flags.addDirs, addDirs...)
+		theme, rest, err := splitLeadingThemeFlag(rest)
+		if err != nil {
+			return rootFlags{}, nil, err
+		}
+		if theme != "" {
+			// The last occurrence wins across passes, as it does within one.
+			flags.theme = theme
+		}
+		allowEscalation, rest, err := splitLeadingAllowEscalationFlag(rest)
+		if err != nil {
+			return rootFlags{}, nil, err
+		}
+		flags.allowEscalation = flags.allowEscalation || allowEscalation
+		args = rest
+		if len(args) == before {
+			return flags, args, nil
+		}
+	}
+}
+
+// splitLeadingAllowEscalationFlag strips a leading --allow-escalation from the
+// root argument list, opting the interactive session into mid-run model
+// escalation.
+//
+// OPT-IN, THE SAME WAY exec IS. Escalation moves a run onto a different model,
+// which changes what the run costs and which provider sees the conversation, so
+// it is a decision the operator makes rather than a default. The exec flag
+// already answers this conservatively and the interactive surface should not
+// answer it differently.
+//
+// Bare flag only: repeating it is harmless, and an =value form is rejected so a
+// mistyped --allow-escalation=false is a loud error instead of silently enabling
+// the thing it was trying to turn off.
+func splitLeadingAllowEscalationFlag(args []string) (bool, []string, error) {
+	allow := false
+	for len(args) > 0 {
+		switch {
+		case args[0] == "--allow-escalation":
+			allow = true
+			args = args[1:]
+		case strings.HasPrefix(args[0], "--allow-escalation="):
+			return false, nil, errors.New("--allow-escalation takes no value; pass it bare to enable mid-run model escalation, or omit it")
+		default:
+			return allow, args, nil
+		}
+	}
+	return allow, args, nil
 }
 
 // splitLeadingThemeFlag strips a leading --theme <auto|theme-name> (space or =form)
@@ -1317,7 +1625,14 @@ Flags:
       --spec-model <model>           Override the draft model when --use-spec is set
       --spec-reasoning-effort <effort>
                                     Override draft reasoning effort when --use-spec is set
+      --plan                         Read-only planning mode: write and shell tools are hidden
+      --permission-mode <mode>       Set permission mode directly (plan, spec-draft, auto, member,
+                                    ask, unsafe). Outranks --auto; prefer --plan / --auto for
+                                    interactive use. Used by specialist/swarm child processes.
       --max-turns <number>           Override the maximum agent loop turns
+      --exec-profile <name>          Apply an execution profile (balanced, fast, thorough): loop
+                                    posture only (turn budget, effort, self-correction, escalation);
+                                    composes with --mode (which picks the model) and explicit flags win
       --auto <low|medium|high>       Set exec autonomy; high enables unsafe tools
       --enabled-tools <tools>        Only expose these comma or space separated tools
       --disabled-tools <tools>       Hide these comma or space separated tools

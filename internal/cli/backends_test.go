@@ -13,17 +13,17 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/config"
-	"github.com/Gitlawb/zero/internal/hooks"
-	"github.com/Gitlawb/zero/internal/mcp"
-	"github.com/Gitlawb/zero/internal/plugins"
-	"github.com/Gitlawb/zero/internal/tools"
-	"github.com/Gitlawb/zero/internal/zerocommands"
+	"github.com/Twigpine/zero/internal/config"
+	"github.com/Twigpine/zero/internal/hooks"
+	"github.com/Twigpine/zero/internal/mcp"
+	"github.com/Twigpine/zero/internal/plugins"
+	"github.com/Twigpine/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/zerocommands"
 )
 
 func TestRunBackendsJSONUsesLifecycleSnapshotWithoutConnectingMCP(t *testing.T) {
 	cwd := t.TempDir()
-	secret := "sk-proj-" + strings.Repeat("a", 24)
+	secret := "sk-proj-" + strings.Repeat("a", 23) + "0"
 	deps := appDeps{
 		getwd: func() (string, error) { return cwd, nil },
 		resolveMCPConfig: func(workspaceRoot string, _ bool) (config.MCPConfig, error) {
@@ -161,7 +161,7 @@ func TestRunBackendsTextAndHelp(t *testing.T) {
 
 func TestRunBackendsDoctorJSONAndTextWithoutConnectingMCP(t *testing.T) {
 	cwd := t.TempDir()
-	secret := "sk-proj-" + strings.Repeat("b", 24)
+	secret := "sk-proj-" + strings.Repeat("b", 23) + "0"
 	deps := appDeps{
 		getwd: func() (string, error) { return cwd, nil },
 		resolveMCPConfig: func(workspaceRoot string, _ bool) (config.MCPConfig, error) {

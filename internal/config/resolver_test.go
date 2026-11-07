@@ -8,7 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/providercatalog"
 )
 
 func TestResolveAppliesLayerPrecedence(t *testing.T) {
@@ -164,6 +165,22 @@ func TestResolveLoadsRecentModelsFromUserConfigOnly(t *testing.T) {
 	}
 	if !reflect.DeepEqual(resolved.Preferences.RecentModels, want) {
 		t.Fatalf("RecentModels = %#v, want %#v", resolved.Preferences.RecentModels, want)
+	}
+}
+
+func TestResolveLoadsPetFromUserConfigOnly(t *testing.T) {
+	userPath := writeConfig(t, `{"preferences":{"pet":" boba "}}`)
+	projectPath := writeConfig(t, `{"preferences":{"pet":"project-pet"}}`)
+	resolved, err := Resolve(ResolveOptions{
+		UserConfigPath:    userPath,
+		ProjectConfigPath: projectPath,
+		Env:               map[string]string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Preferences.Pet != "boba" {
+		t.Fatalf("Preferences.Pet = %q, want user preference boba", resolved.Preferences.Pet)
 	}
 }
 
@@ -554,7 +571,7 @@ func TestResolveReplacesMCPServerOverlayCollections(t *testing.T) {
 	}
 }
 
-func TestResolveMCPServerLayersCanClearAndReenable(t *testing.T) {
+func TestResolveMCPServerLayersCannotReenableUserDisabled(t *testing.T) {
 	userPath := writeConfig(t, `{
 		"mcp": {
 			"servers": {
@@ -588,14 +605,135 @@ func TestResolveMCPServerLayersCanClearAndReenable(t *testing.T) {
 	}
 
 	docs := resolved.MCP.Servers["docs"]
-	if docs.Disabled {
-		t.Fatalf("docs.Disabled = true, want project layer to re-enable")
+	// A user-level disable is sticky: project config must not re-enable it.
+	if !docs.Disabled {
+		t.Fatal("docs.Disabled = false, want user-level disable to remain sticky")
 	}
+	// Non-disable fields from the project layer still merge normally.
 	if len(docs.Args) != 0 {
 		t.Fatalf("docs.Args = %#v, want project layer to clear inherited args", docs.Args)
 	}
 	if len(docs.Env) != 0 {
 		t.Fatalf("docs.Env = %#v, want project layer to clear inherited env", docs.Env)
+	}
+}
+
+func TestMergeMCPStickyDisableReenable(t *testing.T) {
+	disabled := MCPServerConfig{Disabled: true, disabledSet: true}
+
+	// A lower-trust (project) layer must not lift a sticky user disable.
+	project := MCPServerConfig{Disabled: false, disabledSet: true}
+	if got := mergeMCPServer(disabled, project, false); !got.Disabled {
+		t.Fatal("project layer re-enabled a sticky user disable")
+	}
+
+	// The user scope (explicit mcp enable command / CLI override) may re-enable.
+	override := MCPServerConfig{Disabled: false, disabledSet: true}
+	if got := mergeMCPServer(disabled, override, true); got.Disabled {
+		t.Fatal("user-scope override must be able to re-enable")
+	}
+
+	// A user-scope disable stacked on a project attempt still sticks.
+	if got := mergeMCPServer(disabled, project, false); !got.Disabled {
+		t.Fatal("sticky disable must survive a project re-enable attempt")
+	}
+
+	// Baseline: a project layer may disable a default-enabled server when no
+	// higher-trust scope has explicitly set disabled (the trust boundary must
+	// not block legitimate project disables). Regression guard for the
+	// disabledSet-before-check ordering bug.
+	defaultEnabled := MCPServerConfig{Disabled: false, disabledSet: false}
+	projectDisable := MCPServerConfig{Disabled: true, disabledSet: true}
+	if got := mergeMCPServer(defaultEnabled, projectDisable, false); !got.Disabled {
+		t.Fatal("project layer should be able to disable a default-enabled server")
+	}
+
+	// And an empty project layer must not flip an unconfigured server to disabled.
+	if got := mergeMCPServer(MCPServerConfig{}, MCPServerConfig{}, false); got.Disabled {
+		t.Fatal("an empty project layer must not disable an unconfigured server")
+	}
+}
+
+// TestResolveMCPCannotReenableUserDisabled exercises the trust boundary at the
+// actual ResolveMCP entry point: a project config (project scope) must not lift
+// a disable the user set in their higher-trust user config.
+func TestResolveMCPCannotReenableUserDisabled(t *testing.T) {
+	userPath := writeConfig(t, `{
+		"mcp": {
+			"servers": {
+				"docs": {
+					"type": "stdio",
+					"command": "docs-mcp",
+					"disabled": true
+				}
+			}
+		}
+	}`)
+	// Project config tries to re-enable it.
+	projectPath := writeConfig(t, `{
+		"mcpServers": {
+			"docs": {
+				"disabled": false
+			}
+		}
+	}`)
+
+	resolved, err := ResolveMCP(ResolveOptions{
+		UserConfigPath:    userPath,
+		ProjectConfigPath: projectPath,
+	})
+	if err != nil {
+		t.Fatalf("ResolveMCP() error = %v", err)
+	}
+
+	docs, ok := resolved.Servers["docs"]
+	if !ok {
+		t.Fatal("docs server missing from resolved config")
+	}
+	if !docs.Disabled {
+		t.Fatalf("docs.Disabled = false, want user-level disable to remain sticky across project re-enable")
+	}
+}
+
+// TestResolveMCPUserLiftsProjectDisabled asserts the reverse direction is open:
+// a user config (higher-trust scope) re-enabling a server the project config
+// disabled must be permitted, since user > project in the trust hierarchy.
+func TestResolveMCPUserLiftsProjectDisabled(t *testing.T) {
+	// Project config disables the server.
+	projectPath := writeConfig(t, `{
+		"mcpServers": {
+			"docs": {
+				"type": "stdio",
+				"command": "docs-mcp",
+				"disabled": true
+			}
+		}
+	}`)
+	// User config re-enables it.
+	userPath := writeConfig(t, `{
+		"mcp": {
+			"servers": {
+				"docs": {
+					"disabled": false
+				}
+			}
+		}
+	}`)
+
+	resolved, err := ResolveMCP(ResolveOptions{
+		UserConfigPath:    userPath,
+		ProjectConfigPath: projectPath,
+	})
+	if err != nil {
+		t.Fatalf("ResolveMCP() error = %v", err)
+	}
+
+	docs, ok := resolved.Servers["docs"]
+	if !ok {
+		t.Fatal("docs server missing from resolved config")
+	}
+	if docs.Disabled {
+		t.Fatalf("docs.Disabled = true, want user scope to lift the project-level disable")
 	}
 }
 
@@ -971,6 +1109,34 @@ func TestResolveProviderCommandOverridesEnvProviderFields(t *testing.T) {
 	}
 }
 
+func TestResolveProviderCommandCannotRelaxUserModelRPM(t *testing.T) {
+	userPath := writeConfig(t, `{
+		"modelRPM": {
+			"gpt-command": 5
+		}
+	}`)
+
+	command := writeCommand(t, commandScript{
+		Stdout: `{"activeProvider":"cmd","providers":[{"name":"cmd","provider":"openai","apiKey":"sk-command","model":"gpt-command"}],"modelRPM":{"gpt-command":10}}`,
+	})
+
+	resolved, err := Resolve(ResolveOptions{
+		UserConfigPath:  userPath,
+		ProviderCommand: command,
+		Env:             map[string]string{},
+	})
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+
+	if got := resolved.ModelRPM["gpt-command"]; got != 5 {
+		t.Fatalf(
+			"ModelRPM[gpt-command] = %d, want user cap 5 preserved against provider-command relaxation",
+			got,
+		)
+	}
+}
+
 func TestResolveAllowsNoConfiguredProviders(t *testing.T) {
 	resolved, err := Resolve(ResolveOptions{Env: map[string]string{}})
 	if err != nil {
@@ -1013,8 +1179,13 @@ func TestResolveRejectsActiveProviderWithoutConfiguredProfiles(t *testing.T) {
 	if HasProviderProfile(resolved.Provider) {
 		t.Fatalf("Provider = %#v, want zero value", resolved.Provider)
 	}
-	if resolved.MaxTurns != 0 {
-		t.Fatalf("MaxTurns = %d, want zero on failed resolve", resolved.MaxTurns)
+	// The error path now carries the parsed non-provider fields through
+	// (maintainer review, PR #1001): the TUI's provider-recovery startup
+	// forwards this partial config, and a zero MaxTurns there would silently
+	// discard the user's turn budget. Matches the no-providers SUCCESS path,
+	// which has always defaulted MaxTurns.
+	if resolved.MaxTurns != defaultMaxTurns {
+		t.Fatalf("MaxTurns = %d, want default %d carried through the partial resolve", resolved.MaxTurns, defaultMaxTurns)
 	}
 }
 
@@ -1023,10 +1194,13 @@ func TestResolveKeepsNormalizedProvidersWhenNoneMarkedActive(t *testing.T) {
 	// activeProvider is blank/stale — a caller like the interactive TUI still
 	// needs the normalized list to fall back to an already-usable provider
 	// instead of forcing a full re-onboarding wizard.
-	path := writeConfig(t, `{"providers":[
-		{"name":"work","provider_kind":"openai","apiKey":"sk-test","model":"gpt-test"},
-		{"name":"other","provider_kind":"openai","apiKey":"sk-other","model":"gpt-test"}
-	]}`)
+	path := writeConfig(t, `{
+    "modelRPM":{"gpt-test":1},
+    "providers":[
+        {"name":"work","provider_kind":"openai","apiKey":"sk-test","model":"gpt-test"},
+        {"name":"other","provider_kind":"openai","apiKey":"sk-other","model":"gpt-test"}
+    ]
+}`)
 
 	resolved, err := Resolve(ResolveOptions{ProjectConfigPath: path, Env: map[string]string{}})
 	if !errors.Is(err, ErrNoActiveProvider) {
@@ -1034,6 +1208,9 @@ func TestResolveKeepsNormalizedProvidersWhenNoneMarkedActive(t *testing.T) {
 	}
 	if len(resolved.Providers) != 2 {
 		t.Fatalf("Providers = %#v, want the 2 normalized profiles preserved despite the error", resolved.Providers)
+	}
+	if got := resolved.ModelRPM["gpt-test"]; got != 1 {
+		t.Fatalf("ModelRPM[gpt-test] = %d, want 1 preserved despite ErrNoActiveProvider", got)
 	}
 }
 
@@ -1374,6 +1551,71 @@ func TestResolveProviderProfileExtendedJSONAliases(t *testing.T) {
 	}
 }
 
+func TestApplyCatalogDescriptorFoldsCustomHeadersCaseInsensitively(t *testing.T) {
+	t.Setenv("AIMLAPI_PARTNER_ID", "part_env")
+	descriptor, err := providercatalog.Require("aimlapi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := ProviderProfile{
+		BaseURL: descriptor.DefaultBaseURL,
+		CustomHeaders: map[string]string{
+			"x-aimlapi-partner-id": "part_override",
+		},
+	}
+
+	applyCatalogDescriptor(&profile, descriptor, true)
+
+	if got := profile.CustomHeaders["X-AIMLAPI-Partner-ID"]; got != "part_override" {
+		t.Fatalf("canonical header value = %q, want override", got)
+	}
+	if _, duplicate := profile.CustomHeaders["x-aimlapi-partner-id"]; duplicate {
+		t.Fatalf("case-colliding header survived merge: %#v", profile.CustomHeaders)
+	}
+}
+
+func TestApplyCatalogDescriptorUsesAimlapiPartnerEnvironmentOverride(t *testing.T) {
+	t.Setenv("AIMLAPI_PARTNER_ID", "part_env")
+	descriptor, err := providercatalog.Require("aimlapi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := ProviderProfile{BaseURL: descriptor.DefaultBaseURL}
+
+	applyCatalogDescriptor(&profile, descriptor, true)
+
+	if got := profile.CustomHeaders["X-AIMLAPI-Partner-ID"]; got != "part_env" {
+		t.Fatalf("partner header = %q, want part_env", got)
+	}
+}
+
+func TestApplyCatalogDescriptorStripsAimlapiAttributionFromRetargetedProfile(t *testing.T) {
+	descriptor, err := providercatalog.Require("aimlapi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := ProviderProfile{
+		BaseURL: "https://proxy.example.test/v1",
+		CustomHeaders: map[string]string{
+			"x-aimlapi-partner-id":          "persisted-partner",
+			"X-AIMLAPI-Integration-Repo":    "Gitlawb/zero",
+			"X-AIMLAPI-Integration-Version": "zero",
+			"X-Environment":                 "staging",
+		},
+	}
+
+	applyCatalogDescriptor(&profile, descriptor, true)
+
+	for key := range profile.CustomHeaders {
+		if strings.HasPrefix(strings.ToLower(key), "x-aimlapi-") {
+			t.Fatalf("catalog attribution survived retargeting: %#v", profile.CustomHeaders)
+		}
+	}
+	if profile.CustomHeaders["X-Environment"] != "staging" {
+		t.Fatalf("user header was removed: %#v", profile.CustomHeaders)
+	}
+}
+
 func TestResolveProviderProfileParseThinkTagsFalseAlias(t *testing.T) {
 	path := writeConfig(t, `{
 		"activeProvider": "custom",
@@ -1557,6 +1799,85 @@ func TestResolveSandboxNetworkProjectConfigCannotWeaken(t *testing.T) {
 	}
 }
 
+func TestResolveSandboxEnabledUserConfigDisables(t *testing.T) {
+	userPath := writeConfig(t, `{"sandbox": {"enabled": false}}`)
+	resolved, err := Resolve(ResolveOptions{UserConfigPath: userPath, Env: map[string]string{}})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved.Sandbox.Enabled == nil || *resolved.Sandbox.Enabled {
+		t.Fatalf("user config enabled:false must resolve to a false pointer, got %v", resolved.Sandbox.Enabled)
+	}
+}
+
+func TestResolveSandboxDisableIgnoredFromProjectConfig(t *testing.T) {
+	// Security: a cloned repo's project config must NOT be able to disable the
+	// sandbox that constrains it. Only global config / CLI can turn it off.
+	userPath := writeConfig(t, `{}`)
+	projectPath := writeConfig(t, `{"sandbox": {"enabled": false}}`)
+	resolved, err := Resolve(ResolveOptions{UserConfigPath: userPath, ProjectConfigPath: projectPath, Env: map[string]string{}})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved.Sandbox.Enabled != nil {
+		t.Fatalf("project config enabled:false must be ignored, got %v — a repo could disable the sandbox", *resolved.Sandbox.Enabled)
+	}
+}
+
+func TestResolveSandboxEnabledIgnoredFromProviderCommand(t *testing.T) {
+	// Security: a provider command is an arbitrary executable named in config, and
+	// its stdout is parsed into a full FileConfig — so it must NOT be able to reach
+	// Sandbox.Enabled, in either direction. Same rule as project config: only global
+	// config / CLI may turn the sandbox off.
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{name: "cannot disable", value: "false"},
+		{name: "cannot enable", value: "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			command := writeCommand(t, commandScript{
+				Stdout: `{"activeProvider":"cmd","providers":[{"name":"cmd","provider":"openai","apiKey":"sk-command","model":"gpt-command"}],"sandbox":{"enabled":` + tc.value + `}}`,
+			})
+			resolved, err := Resolve(ResolveOptions{ProviderCommand: command, Env: map[string]string{}})
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			// The provider itself must still be applied — only the sandbox toggle is dropped.
+			if resolved.ActiveProvider != "cmd" {
+				t.Fatalf("ActiveProvider = %q, want cmd (provider command must still apply)", resolved.ActiveProvider)
+			}
+			if resolved.Sandbox.Enabled != nil {
+				t.Fatalf("provider command set sandbox.enabled=%s, got %v — a provider command could toggle the sandbox", tc.value, *resolved.Sandbox.Enabled)
+			}
+		})
+	}
+}
+
+func TestResolveSandboxEnabledCLIOverride(t *testing.T) {
+	// A CLI/programmatic override (applied after every config source) must be able
+	// to disable the sandbox, even with no config file.
+	disabled := false
+	resolved, err := Resolve(ResolveOptions{Env: map[string]string{}, Overrides: Overrides{Sandbox: SandboxConfig{Enabled: &disabled}}})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved.Sandbox.Enabled == nil || *resolved.Sandbox.Enabled {
+		t.Fatalf("CLI override enabled:false must disable the sandbox, got %v", resolved.Sandbox.Enabled)
+	}
+	// An explicit true override must win over a lower-precedence global-config false.
+	userPath := writeConfig(t, `{"sandbox": {"enabled": false}}`)
+	enabled := true
+	resolved2, err := Resolve(ResolveOptions{UserConfigPath: userPath, Env: map[string]string{}, Overrides: Overrides{Sandbox: SandboxConfig{Enabled: &enabled}}})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved2.Sandbox.Enabled == nil || !*resolved2.Sandbox.Enabled {
+		t.Fatalf("CLI override enabled:true must win over config false, got %v", resolved2.Sandbox.Enabled)
+	}
+}
+
 func TestResolveNotifyValid(t *testing.T) {
 	path := writeConfig(t, `{"notify":{"mode":"both","focusMode":"always"}}`)
 	resolved, err := Resolve(ResolveOptions{UserConfigPath: path, Env: map[string]string{}})
@@ -1582,14 +1903,43 @@ func TestResolveNotifyInvalidFocusMode(t *testing.T) {
 	}
 }
 
-func TestResolveNotifyDefaultEmpty(t *testing.T) {
-	path := writeConfig(t, `{}`)
-	resolved, err := Resolve(ResolveOptions{UserConfigPath: path, Env: map[string]string{}})
+// An unconfigured notify block must resolve EMPTY. Defaults live in the TUI
+// (effectiveTUINotifyMode) and in `zero config notify`'s display, not in the
+// resolver: a filled-in default here leaks into headless `zero exec` (BEL +
+// OSC-9 bytes on stderr under -o json) and into the CLI/TUI preserve paths,
+// which must treat "user never chose" differently from "user chose both"
+// (maintainer review, PR #1001).
+func TestResolveNotifyUnconfiguredStaysEmpty(t *testing.T) {
+	// No config file at all.
+	resolved, err := Resolve(ResolveOptions{Env: map[string]string{}})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if resolved.Notify.Mode != "" || resolved.Notify.FocusMode != "" {
-		t.Fatalf("unset notify should be empty, got %+v", resolved.Notify)
+		t.Fatalf("no config file: notify = %+v, want empty (resolver must not default)", resolved.Notify)
+	}
+
+	for name, body := range map[string]string{
+		"empty config": `{}`,
+		"empty block":  `{"notify":{}}`,
+		"mode only":    `{"notify":{"mode":"off"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			resolved, err := Resolve(ResolveOptions{UserConfigPath: writeConfig(t, body), Env: map[string]string{}})
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if name == "mode only" {
+				if resolved.Notify.Mode != "off" {
+					t.Errorf("notify.mode = %q, want preserved off", resolved.Notify.Mode)
+				}
+			} else if resolved.Notify.Mode != "" {
+				t.Errorf("notify.mode = %q, want empty (resolver must not default)", resolved.Notify.Mode)
+			}
+			if resolved.Notify.FocusMode != "" {
+				t.Errorf("notify.focusMode = %q, want empty (resolver must not default)", resolved.Notify.FocusMode)
+			}
+		})
 	}
 }
 
@@ -1931,5 +2281,103 @@ func TestResolveRequiresModelErrorIsSetupFixable(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "sk-x") {
 		t.Fatalf("error leaked API key: %q", err.Error())
+	}
+}
+
+func TestCrossSessionInboundProjectConfigCanOnlyTighten(t *testing.T) {
+	tests := []struct {
+		name    string
+		user    string
+		project string
+		want    string
+	}{
+		{name: "hold tightens accept", user: "accept", project: "hold", want: "hold"},
+		{name: "refuse stays refuse", user: "refuse", project: "accept", want: "refuse"},
+		{name: "accept cannot weaken parity", project: "accept", want: ""},
+		{name: "refuse tightens parity", project: "refuse", want: "refuse"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := FileConfig{CrossSessionInbound: test.user}
+			if err := mergeProjectConfig(&cfg, FileConfig{CrossSessionInbound: test.project}); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.CrossSessionInbound != test.want {
+				t.Fatalf("crossSessionInbound = %q, want %q", cfg.CrossSessionInbound, test.want)
+			}
+		})
+	}
+}
+
+func TestResolveRejectsInvalidCrossSessionInbound(t *testing.T) {
+	path := writeConfig(t, `{
+		"activeProvider": "openai",
+		"providers": [{"name":"openai","provider_kind":"openai","apiKey":"sk-x","model":"gpt-5"}],
+		"crossSessionInbound": "sometimes"
+	}`)
+	_, err := Resolve(ResolveOptions{UserConfigPath: path, Env: map[string]string{}})
+	if err == nil || !strings.Contains(err.Error(), "expected accept, hold, or refuse") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestResolveReportsExplicitMaxTurns(t *testing.T) {
+	// A nil ResolveOptions.Env means "read the real process environment" (see
+	// envValue), so a case that leaves it nil inherits whatever the developer
+	// happens to export. ANTHROPIC_BASE_URL alone is enough: applyProviderEnv
+	// synthesizes a second, keyless "anthropic" profile from a base URL on its
+	// own, the single-provider shortcut in normalizeProviders stops applying,
+	// and Resolve fails with `active provider "" not found` before this test
+	// reaches its assertion. Every variable the resolver reads does it, so the
+	// cases below state an EMPTY environment rather than no environment, and
+	// these three are set to a hostile value so the test proves it.
+	t.Setenv("ANTHROPIC_BASE_URL", "https://proxy.example/v1")
+	t.Setenv("OPENAI_API_KEY", "from-the-developer-shell")
+	t.Setenv(MaxTurnsEnv, "7")
+
+	const providerJSON = `{
+		"activeProvider": "p",
+		"providers": [{"name": "p", "provider_kind": "openai-compatible", "base_url": "https://x.example/v1", "apiKey": "k", "model": "m"}]
+	}`
+	providerWithTurns := strings.Replace(providerJSON, `"activeProvider": "p"`, `"activeProvider": "p", "maxTurns": 40`, 1)
+
+	cases := []struct {
+		name string
+		opts ResolveOptions
+		set  bool
+	}{
+		{"built-in default only", ResolveOptions{
+			Env:       map[string]string{},
+			Overrides: Overrides{Provider: ProviderProfile{Name: "p", ProviderKind: "openai-compatible", BaseURL: "https://x.example/v1", APIKey: "k", Model: "m"}},
+		}, false},
+		{"user config", ResolveOptions{
+			Env:            map[string]string{},
+			UserConfigPath: writeConfig(t, providerWithTurns),
+		}, true},
+		{"project config", ResolveOptions{
+			Env:               map[string]string{},
+			UserConfigPath:    writeConfig(t, providerJSON),
+			ProjectConfigPath: writeConfig(t, `{"maxTurns": 40}`),
+		}, true},
+		{"env", ResolveOptions{
+			Env:       map[string]string{MaxTurnsEnv: "120"},
+			Overrides: Overrides{Provider: ProviderProfile{Name: "p", ProviderKind: "openai-compatible", BaseURL: "https://x.example/v1", APIKey: "k", Model: "m"}},
+		}, true},
+		{"cli override", ResolveOptions{
+			Env: map[string]string{},
+			Overrides: Overrides{
+				MaxTurns: 42,
+				Provider: ProviderProfile{Name: "p", ProviderKind: "openai-compatible", BaseURL: "https://x.example/v1", APIKey: "k", Model: "m"},
+			},
+		}, true},
+	}
+	for _, tc := range cases {
+		resolved, err := Resolve(tc.opts)
+		if err != nil {
+			t.Fatalf("%s: Resolve() error = %v", tc.name, err)
+		}
+		if resolved.MaxTurnsSet != tc.set {
+			t.Fatalf("%s: MaxTurnsSet = %v, want %v (MaxTurns=%d)", tc.name, resolved.MaxTurnsSet, tc.set, resolved.MaxTurns)
+		}
 	}
 }

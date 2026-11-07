@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gitlawb/zero/internal/redaction"
-	"github.com/Gitlawb/zero/internal/testrunner"
+	"github.com/Twigpine/zero/internal/redaction"
+	"github.com/Twigpine/zero/internal/testrunner"
 )
 
 type Status string
@@ -208,37 +208,6 @@ func Run(ctx context.Context, plan Plan, options RunOptions) Report {
 	}
 	report.Summary.Total = len(report.Results)
 	report.OK = report.Summary.Failed == 0 && report.Summary.Errors == 0
-	report.EndedAt = formatTime(now())
-	return report
-}
-
-func RunLoop(ctx context.Context, plan Plan, options LoopOptions) LoopReport {
-	now := options.Now
-	if now == nil {
-		now = time.Now
-	}
-	start := now()
-	report := LoopReport{
-		StartedAt: formatTime(start),
-		OK:        false,
-	}
-	maxAttempts := firstPositive(options.MaxAttempts, 1)
-	for attemptNumber := 1; attemptNumber <= maxAttempts; attemptNumber++ {
-		attemptReport := Run(ctx, plan, options.RunOptions)
-		attempt := Attempt{Number: attemptNumber, Report: attemptReport}
-		report.Attempts = append(report.Attempts, attempt)
-		report.Summary = attemptReport.Summary
-		if attemptReport.OK {
-			report.OK = true
-			break
-		}
-		if attemptNumber < maxAttempts && options.OnFailure != nil {
-			if err := options.OnFailure(ctx, attempt); err != nil {
-				report.Error = redaction.RedactString(err.Error(), redaction.Options{})
-				break
-			}
-		}
-	}
 	report.EndedAt = formatTime(now())
 	return report
 }

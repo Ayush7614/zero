@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Gitlawb/zero/internal/background"
-	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Twigpine/zero/internal/background"
+	"github.com/Twigpine/zero/internal/tools"
 )
 
 type StopTool struct {
@@ -16,10 +16,6 @@ type StopTool struct {
 
 type stopParameters struct {
 	TaskID string
-}
-
-func NewStopTool(manager *background.Manager) *StopTool {
-	return &StopTool{manager: manager}
 }
 
 func newStopToolWithManagerFunc(managerFunc BackgroundManagerFunc) *StopTool {

@@ -9,10 +9,16 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/zeroruntime"
+	"github.com/Twigpine/zero/internal/providers/providerio"
+	"github.com/Twigpine/zero/internal/zeroruntime"
 )
 
+func init() {
+	providerio.ShrinkBackoffForTest()
+}
+
 func TestStreamCompletionPostsMessagesRequest(t *testing.T) {
+	t.Parallel()
 	var gotPath string
 	var gotAPIKey string
 	var gotVersion string
@@ -123,6 +129,7 @@ func TestStreamCompletionPostsMessagesRequest(t *testing.T) {
 }
 
 func TestStreamCompletionAppliesCustomAuthAndHeaders(t *testing.T) {
+	t.Parallel()
 	var gotDefaultAuth string
 	var gotCustomAuth string
 	var gotTenant string
@@ -165,6 +172,7 @@ func TestStreamCompletionAppliesCustomAuthAndHeaders(t *testing.T) {
 }
 
 func TestStreamCompletionEmitsTextUsageAndDone(t *testing.T) {
+	t.Parallel()
 	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		writeSSEEvent(w, "message_start", `{"type":"message_start","message":{"usage":{"input_tokens":25}}}`)
 		writeSSEEvent(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`)
@@ -186,6 +194,7 @@ func TestStreamCompletionEmitsTextUsageAndDone(t *testing.T) {
 }
 
 func TestStreamCompletionReportsCacheTokens(t *testing.T) {
+	t.Parallel()
 	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		writeSSEEvent(w, "message_start", `{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":200,"cache_creation_input_tokens":40}}}`)
 		writeSSEEvent(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`)
@@ -217,6 +226,7 @@ func TestStreamCompletionReportsCacheTokens(t *testing.T) {
 }
 
 func TestStreamCompletionEnablesThinkingWhenEffortRequested(t *testing.T) {
+	t.Parallel()
 	var gotBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
@@ -256,7 +266,55 @@ func TestStreamCompletionEnablesThinkingWhenEffortRequested(t *testing.T) {
 	}
 }
 
+func TestStreamCompletionUsesMiniMaxAdaptiveEffort(t *testing.T) {
+	t.Parallel()
+
+	for _, effort := range []string{"low", "xhigh"} {
+		effort := effort
+		t.Run(effort, func(t *testing.T) {
+			t.Parallel()
+			var gotBody map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+					t.Fatalf("decode request body: %v", err)
+				}
+				writeSSEEvent(w, "message_stop", `{"type":"message_stop"}`)
+			}))
+			defer server.Close()
+
+			provider, err := New(Options{BaseURL: server.URL + "/", Model: "MiniMax-M3.1-Flash", MaxTokens: 64_000})
+			if err != nil {
+				t.Fatalf("New returned error: %v", err)
+			}
+			stream, err := provider.StreamCompletion(context.Background(), zeroruntime.CompletionRequest{
+				Messages:        []zeroruntime.Message{{Role: zeroruntime.MessageRoleUser, Content: "hi"}},
+				ReasoningEffort: effort,
+			})
+			if err != nil {
+				t.Fatalf("StreamCompletion returned error: %v", err)
+			}
+			drain(stream)
+
+			thinking, ok := gotBody["thinking"].(map[string]any)
+			if !ok || thinking["type"] != "adaptive" {
+				t.Fatalf("thinking = %#v, want adaptive", gotBody["thinking"])
+			}
+			if _, ok := thinking["budget_tokens"]; ok {
+				t.Fatalf("MiniMax thinking must not include budget_tokens: %#v", thinking)
+			}
+			outputConfig, ok := gotBody["output_config"].(map[string]any)
+			if !ok || outputConfig["effort"] != effort {
+				t.Fatalf("output_config = %#v, want effort %q", gotBody["output_config"], effort)
+			}
+			if mt, _ := gotBody["max_tokens"].(float64); int(mt) != 64_000 {
+				t.Fatalf("max_tokens = %#v, want unchanged 64000", gotBody["max_tokens"])
+			}
+		})
+	}
+}
+
 func TestStreamCompletionOmitsThinkingWithoutEffort(t *testing.T) {
+	t.Parallel()
 	var gotBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
@@ -287,6 +345,7 @@ func TestStreamCompletionOmitsThinkingWithoutEffort(t *testing.T) {
 }
 
 func TestStreamCompletionCapturesThinkingBlocksForReplay(t *testing.T) {
+	t.Parallel()
 	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		writeSSEEvent(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`)
 		writeSSEEvent(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think"}}`)
@@ -312,6 +371,7 @@ func TestStreamCompletionCapturesThinkingBlocksForReplay(t *testing.T) {
 }
 
 func TestStreamCompletionPreservesUnclosedThinkingBlockAtStreamEnd(t *testing.T) {
+	t.Parallel()
 	// The SSE ends after thinking_delta/signature_delta but BEFORE the thinking
 	// block's content_block_stop. The open buffer must still be finalized into the
 	// done event's ReasoningBlocks (via closeOpen), or the next Anthropic replay
@@ -339,6 +399,7 @@ func TestStreamCompletionPreservesUnclosedThinkingBlockAtStreamEnd(t *testing.T)
 }
 
 func TestAnthropicRequestReplaysThinkingBlocksFirst(t *testing.T) {
+	t.Parallel()
 	var gotBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
@@ -392,6 +453,7 @@ func TestAnthropicRequestReplaysThinkingBlocksFirst(t *testing.T) {
 }
 
 func TestStreamCompletionEmitsToolUseBlocks(t *testing.T) {
+	t.Parallel()
 	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		writeSSEEvent(w, "content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}`)
 		writeSSEEvent(w, "content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}`)
@@ -414,6 +476,7 @@ func TestStreamCompletionEmitsToolUseBlocks(t *testing.T) {
 }
 
 func TestStreamCompletionClosesOpenToolCallOnEOF(t *testing.T) {
+	t.Parallel()
 	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		writeSSEEvent(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"grep","input":{}}}`)
 		writeSSEEvent(w, "content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"Zero\"}"}}`)
@@ -429,6 +492,7 @@ func TestStreamCompletionClosesOpenToolCallOnEOF(t *testing.T) {
 }
 
 func TestStreamCompletionClassifiesHTTPErrorsAndRedactsToken(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name       string
 		status     int
@@ -464,6 +528,7 @@ func TestStreamCompletionClassifiesHTTPErrorsAndRedactsToken(t *testing.T) {
 }
 
 func TestStreamCompletionEmitsStreamErrorObject(t *testing.T) {
+	t.Parallel()
 	provider := newTestProviderWithKey(t, "sk-ant", func(w http.ResponseWriter, r *http.Request) {
 		writeSSEEvent(w, "error", `{"type":"error","error":{"message":"stream failed sk-ant","type":"overloaded_error"}}`)
 	})
@@ -481,6 +546,7 @@ func TestStreamCompletionEmitsStreamErrorObject(t *testing.T) {
 }
 
 func TestStreamCompletionRejectsMalformedHistoryBeforeDispatch(t *testing.T) {
+	t.Parallel()
 	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("provider should not dispatch malformed history")
 	})
@@ -507,6 +573,7 @@ func TestStreamCompletionRejectsMalformedHistoryBeforeDispatch(t *testing.T) {
 }
 
 func TestNewRequiresModelAndPositiveMaxTokens(t *testing.T) {
+	t.Parallel()
 	if _, err := New(Options{}); err == nil {
 		t.Fatal("New without model returned nil error")
 	}

@@ -3,8 +3,8 @@ package tui
 import (
 	"testing"
 
-	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/providermodeldiscovery"
+	"github.com/Twigpine/zero/internal/modelregistry"
+	"github.com/Twigpine/zero/internal/providermodeldiscovery"
 )
 
 func TestModelContextWindowUsesCachedCatalog(t *testing.T) {
@@ -43,6 +43,23 @@ func TestModelSupportsVisionTUIChecksDiscoveredBeforeHeuristic(t *testing.T) {
 
 	if m.modelSupportsVisionTUI() {
 		t.Fatal("discovered text-only model must not fall through to vision name heuristic")
+	}
+}
+
+func TestModelSupportsVisionTUIFallsBackWhenLiveMetadataOmitsModalities(t *testing.T) {
+	registry := mustTestModelRegistry(t, testModelEntry("custom-known", 12345, []modelregistry.ModelCapability{
+		modelregistry.ModelCapabilityChat,
+	}))
+	m := model{
+		modelName:    "gpt-5.6-sol",
+		modelCatalog: registry,
+		modelPickerLiveByProvider: map[string][]providermodeldiscovery.Model{
+			"chatgpt": {{ID: "gpt-5.6-sol"}},
+		},
+	}
+
+	if !m.modelSupportsVisionTUI() {
+		t.Fatal("live discovery without modality metadata must fall back to the model capability heuristic")
 	}
 }
 
